@@ -117,7 +117,6 @@ latest_backup_dir() {
 # Helpers
 ###############################################################################
 to_int() {
-  # best-effort convert to integer, fallback 0
   local s="${1:-}"
   if [[ "$s" =~ ^[0-9]+$ ]]; then
     echo "$s"
@@ -265,7 +264,7 @@ tier_max() {
   if [[ "$ra" -ge "$rb" ]]; then echo "$a"; else echo "$b"; fi
 }
 
-# Conntrack: softer but not too low for small VPS
+# Conntrack: not too low for small VPS
 # ct_soft = RAM_MiB * 64 + CPU * 8192
 ct_soft_from_ram_cpu() {
   local mem_mb="$1" cpu="$2"
@@ -321,33 +320,44 @@ print_run_table() {
   printf "%-12s | %s\n" "Backup"      "${backup:-"-"}"
 }
 
-_print_diff_row() { local label="$1" b="$2" a="$3"; [[ "$b" == "$a" ]] && return 0; printf "%-12s | %-24s | %-24s\n" "$label" "$b" "$a"; }
-
-print_changes_table_diff() {
+print_planned_table() {
+  # global vars populated in apply_cmd: P_*
   echo
-  echo "Changed (before -> after)"
+  echo "Planned (computed targets)"
+  printf "%-16s | %s\n" "TCP"           "${P_TCP_CC}"
+  printf "%-16s | %s\n" "Qdisc"         "${P_QDISC}"
+  printf "%-16s | %s\n" "Forward"       "${P_FWD}"
+  printf "%-16s | %s\n" "Conntrack"     "${P_CT_FINAL} (soft ${P_CT_SOFT}, clamp ${P_CT_CLAMPED})"
+  printf "%-16s | %s\n" "TW buckets"    "${P_TW_FINAL}"
+  printf "%-16s | %s\n" "Nofile"        "${P_NOFILE_FINAL}"
+  printf "%-16s | %s\n" "Swappiness"    "${P_SWAPPINESS}"
+  printf "%-16s | %s\n" "Journald cap"  "${P_JOURNAL_CAP}"
+  printf "%-16s | %s\n" "Logrotate"     "rotate ${P_LR_ROTATE}"
+  printf "%-16s | %s\n" "Auto reboot"   "false"
+  printf "%-16s | %s\n" "Reboot time"   "04:00"
+}
+
+print_before_after_all() {
+  echo
+  echo "Before -> After (all)"
   printf "%-12s-+-%-24s-+-%-24s\n" "$(printf '%.0s-' {1..12})" "$(printf '%.0s-' {1..24})" "$(printf '%.0s-' {1..24})"
 
-  local printed=0
-  _print_diff_row "TCP"        "$B_TCP_CC" "$A_TCP_CC" && printed=1 || true
-  _print_diff_row "Qdisc"      "$B_QDISC" "$A_QDISC" && printed=1 || true
-  _print_diff_row "Forward"    "$B_FWD" "$A_FWD" && printed=1 || true
-  _print_diff_row "Conntrack"  "$B_CT_MAX" "$A_CT_MAX" && printed=1 || true
-  _print_diff_row "TW buckets" "$B_TW" "$A_TW" && printed=1 || true
-  _print_diff_row "Swappiness" "$B_SWAPPINESS" "$A_SWAPPINESS" && printed=1 || true
-  _print_diff_row "Swap"       "$B_SWAP" "$A_SWAP" && printed=1 || true
-  _print_diff_row "Nofile"     "$B_NOFILE" "$A_NOFILE" && printed=1 || true
-  _print_diff_row "Journald"   "$B_JOURNAL" "$A_JOURNAL" && printed=1 || true
-  _print_diff_row "Logrotate"  "$B_LOGROT" "$A_LOGROT" && printed=1 || true
+  printf "%-12s | %-24s | %-24s\n" "TCP"        "$B_TCP_CC" "$A_TCP_CC"
+  printf "%-12s | %-24s | %-24s\n" "Qdisc"      "$B_QDISC" "$A_QDISC"
+  printf "%-12s | %-24s | %-24s\n" "Forward"    "$B_FWD" "$A_FWD"
+  printf "%-12s | %-24s | %-24s\n" "Conntrack"  "$B_CT_MAX" "$A_CT_MAX"
+  printf "%-12s | %-24s | %-24s\n" "TW buckets" "$B_TW" "$A_TW"
+  printf "%-12s | %-24s | %-24s\n" "Swappiness" "$B_SWAPPINESS" "$A_SWAPPINESS"
+  printf "%-12s | %-24s | %-24s\n" "Swap"       "$B_SWAP" "$A_SWAP"
+  printf "%-12s | %-24s | %-24s\n" "Nofile"     "$B_NOFILE" "$A_NOFILE"
+  printf "%-12s | %-24s | %-24s\n" "Journald"   "$B_JOURNAL" "$A_JOURNAL"
+  printf "%-12s | %-24s | %-24s\n" "Logrotate"  "$B_LOGROT" "$A_LOGROT"
 
-  # Always show reboot-related rows
   local b_ar b_rt a_ar a_rt
   b_ar="$(_unattended_state "$B_UNATT")"; b_rt="$(_unattended_time "$B_UNATT")"
   a_ar="$(_unattended_state "$A_UNATT")"; a_rt="$(_unattended_time "$A_UNATT")"
   printf "%-12s | %-24s | %-24s\n" "Auto reboot" "$b_ar" "$a_ar"
   printf "%-12s | %-24s | %-24s\n" "Reboot time" "$b_rt" "$a_rt"
-
-  [[ "$printed" -eq 0 ]] && echo "(no changes - already tuned)"
 }
 
 print_manifest_compact() {
@@ -373,7 +383,6 @@ print_manifest_compact() {
 ###############################################################################
 # apply / rollback
 ###############################################################################
-_APPLY_CREATED_BACKUP="0"
 on_apply_fail() {
   local code=$?
   err "Apply failed (exit code=$code)."
@@ -387,8 +396,6 @@ apply_cmd() {
   trap on_apply_fail ERR
 
   mkbackup
-  _APPLY_CREATED_BACKUP="1"
-
   snapshot_before
 
   # Discover resources
@@ -519,7 +526,20 @@ apply_cmd() {
   ct_final="$(imax "$current_ct" "$ct_clamped")"
   local ct_buckets=$((ct_final/4)); [[ "$ct_buckets" -lt 4096 ]] && ct_buckets=4096
 
-  # Swap sizing (only if no swap partition)
+  # Populate "planned" globals for printing
+  P_TCP_CC="bbr"
+  P_QDISC="fq"
+  P_FWD="1"
+  P_CT_SOFT="$ct_soft"
+  P_CT_CLAMPED="$ct_clamped"
+  P_CT_FINAL="$ct_final"
+  P_TW_FINAL="$tw_final"
+  P_NOFILE_FINAL="$nofile_final"
+  P_SWAPPINESS="$swappiness"
+  P_JOURNAL_CAP="${j_system}/${j_runtime}"
+  P_LR_ROTATE="$logrotate_rotate"
+
+  # ---- swap sizing ----
   backup_file /etc/fstab
   local swap_gb=2
   if   [[ "$mem_mb" -lt 2048  ]]; then swap_gb=1
@@ -569,7 +589,7 @@ apply_cmd() {
     fi
   fi
 
-  # Sysctl
+  # ---- sysctl ----
   backup_file /etc/sysctl.conf
   shopt -s nullglob
   for f in /etc/sysctl.d/*.conf; do
@@ -642,7 +662,7 @@ EOM
 
   sysctl --system >/dev/null 2>&1 || true
 
-  # NOFILE (never decrease)
+  # ---- NOFILE ----
   backup_file /etc/systemd/system.conf || true
   mkdir -p /etc/systemd/system.conf.d
   shopt -s nullglob
@@ -674,7 +694,7 @@ EOM
 
   systemctl daemon-reexec >/dev/null 2>&1 || true
 
-  # journald
+  # ---- journald ----
   mkdir -p /etc/systemd/journald.conf.d
   shopt -s nullglob
   for f in /etc/systemd/journald.conf.d/*.conf; do
@@ -693,7 +713,7 @@ RateLimitBurst=1000
 EOM
   systemctl restart systemd-journald >/dev/null 2>&1 || true
 
-  # unattended upgrades
+  # ---- unattended-upgrades ----
   mkdir -p /etc/apt/apt.conf.d
   backup_file /etc/apt/apt.conf.d/99-edge-unattended.conf
   cat > /etc/apt/apt.conf.d/99-edge-unattended.conf <<'EOM'
@@ -701,12 +721,12 @@ Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 EOM
 
-  # irqbalance (best effort)
+  # irqbalance
   if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^irqbalance\.service'; then
     systemctl enable --now irqbalance >/dev/null 2>&1 || true
   fi
 
-  # logrotate
+  # ---- logrotate ----
   backup_file /etc/logrotate.conf
   cat > /etc/logrotate.conf <<EOM
 daily
@@ -754,7 +774,7 @@ EOM
 }
 EOM
 
-  # tmpfiles
+  # ---- tmpfiles ----
   mkdir -p /etc/tmpfiles.d
   backup_file /etc/tmpfiles.d/edge-tmp.conf
   cat > /etc/tmpfiles.d/edge-tmp.conf <<'EOM'
@@ -763,12 +783,12 @@ D /var/tmp        1777 root root 14d
 EOM
   systemd-tmpfiles --create >/dev/null 2>&1 || true
 
-  trap - ERR
   snapshot_after
 
   ok "Applied. Backup: $backup_dir"
   print_run_table "apply" "$profile" "$backup_dir" "$cpu" "$mem_mb" "$gib" "$ram_tier" "$cpu_tier" "$tier" "$disk_mb" "${j_system}/${j_runtime}" "$logrotate_rotate"
-  print_changes_table_diff
+  print_planned_table
+  print_before_after_all
   print_manifest_compact "$manifest"
   echo "BACKUP_DIR=$backup_dir"
 }
@@ -816,7 +836,7 @@ rollback_cmd() {
   printf "%-12s | %s\n" "Host"  "$(host_short)"
   printf "%-12s | %s\n" "Mode"  "rollback"
   printf "%-12s | %s\n" "Backup" "$backup"
-  print_changes_table_diff
+  print_before_after_all
   print_manifest_compact "$man"
 }
 
@@ -829,6 +849,8 @@ status_cmd() {
   printf "%-12s | %s\n" "Qdisc"      "$B_QDISC"
   printf "%-12s | %s\n" "Forward"    "$B_FWD"
   printf "%-12s | %s\n" "Conntrack"  "$B_CT_MAX"
+  printf "%-12s | %s\n" "TW buckets" "$B_TW"
+  printf "%-12s | %s\n" "Swappiness" "$B_SWAPPINESS"
   printf "%-12s | %s\n" "Swap"       "$B_SWAP"
   printf "%-12s | %s\n" "Nofile"     "$B_NOFILE"
   printf "%-12s | %s\n" "Journald"   "$B_JOURNAL"
