@@ -2,26 +2,24 @@
 
 **TL;DR**
 
-- Скрипт для свежего VPS под **много соединений** (VPN / proxy / NAT).
-- Сам выбирает профиль по CPU и RAM.
-- Делает бэкап **перед** изменениями.
-- Есть откат одной командой.
-- Можно запускать через `curl | bash`.
+- Script for a fresh VPS with **many simultaneous connections** (VPN / proxy / NAT).
+- Automatically selects a profile based on CPU and RAM.
+- Always creates a backup before changes.
+- One-command rollback.
+- Can be run via `curl | bash`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/refs/heads/main/initial.sh \
-  | sudo bash -s -- apply
+curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/refs/heads/main/initial.sh   | sudo bash -s -- apply
 ```
 
-Откат:
+Rollback:
 ```bash
 sudo ./initial.sh rollback
 ```
 
 ---
 
-A simple script to prepare a fresh Ubuntu/Debian VPS for **many simultaneous connections**  
-(VPN, proxy, NAT, relay, gateways).
+A simple script to prepare a fresh Ubuntu/Debian VPS for **many concurrent connections**.
 
 It changes a small set of system settings and always creates a **backup** so you can safely roll back.
 
@@ -31,8 +29,7 @@ It changes a small set of system settings and always creates a **backup** so you
 
 ### Run without saving the file
 ```bash
-curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/refs/heads/main/initial.sh \
-  | sudo bash -s -- apply
+curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/refs/heads/main/initial.sh   | sudo bash -s -- apply
 ```
 
 ### Download, edit locally, run
@@ -54,17 +51,17 @@ sudo BACKUP_DIR=/root/edge-tuning-backup-YYYYMMDD-HHMMSS ./initial.sh rollback
 
 ## Commands
 
-- `apply` — apply tuning and create a backup
-- `rollback` — undo changes
-- `status` — show current settings
+- `apply` â apply tuning and create a backup
+- `rollback` â undo changes
+- `status` â show current settings
 
 ---
 
 ## Automatic profile selection
 
 The script **automatically selects a profile** based on CPU and RAM:
-- smaller VPS → smaller limits
-- larger VPS → larger limits
+- smaller VPS â smaller limits
+- larger VPS â larger limits
 
 You can override it:
 ```bash
@@ -75,13 +72,13 @@ sudo FORCE_PROFILE=mid ./initial.sh apply
 
 ## Environment variables
 
-- `EDGE_ASSUME_YES=1` — run without confirmation
-- `EDGE_AUTO_ROLLBACK=1` — auto rollback if apply fails
-- `EDGE_LOG_TS=1` — timestamps in logs
+- `EDGE_ASSUME_YES=1` â run without confirmation
+- `EDGE_AUTO_ROLLBACK=1` â auto rollback if apply fails
+- `EDGE_LOG_TS=1` â timestamps in logs
 
 ### Backup control
-- `BACKUP_DIR=...` — choose backup for rollback
-- `BACKUP_TS=YYYYMMDD-HHMMSS` — set backup folder name manually
+- `BACKUP_DIR=...` â choose backup for rollback
+- `BACKUP_TS=YYYYMMDD-HHMMSS` â set backup folder name manually
 
 Example:
 ```bash
@@ -138,7 +135,7 @@ Configures automatic cleanup for `/tmp` and `/var/tmp`.
 - Database servers or latency-critical workloads
 - Managed environments that already control sysctl and limits
 - Systems where IPv4 forwarding must stay disabled
-- Hosts with custom tuning you don’t want to touch
+- Hosts with custom tuning
 
 ---
 
@@ -152,22 +149,3 @@ The `status` command shows:
 - swap settings
 - log retention
 - auto reboot setting
-
----
-
-# Русская версия
-
-## Коротко
-
-- Скрипт для свежего VPS под **много соединений**.
-- Сам подбирает профиль по CPU и RAM.
-- Делает бэкап перед изменениями.
-- Есть быстрый откат.
-- Можно запускать через `curl | bash`.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/refs/heads/main/initial.sh \
-  | sudo bash -s -- apply
-```
-
----
