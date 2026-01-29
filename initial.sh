@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ###############################################################################
-# Minimal logging (less noise)
+# Minimal logging
 ###############################################################################
 LOG_TS="${EDGE_LOG_TS:-1}"
 ts() { [[ "$LOG_TS" == "1" ]] && date +"%Y-%m-%d %H:%M:%S" || true; }
@@ -11,7 +11,6 @@ _is_tty() { [[ -t 1 ]]; }
 c_reset=$'\033[0m'; c_dim=$'\033[2m'; c_red=$'\033[31m'; c_yel=$'\033[33m'; c_grn=$'\033[32m'
 
 _pfx() { _is_tty && printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}" || true; }
-log()  { _pfx; echo "$*"; }
 ok()   { _pfx; _is_tty && printf "%sOK%s " "$c_grn" "$c_reset" || printf "OK "; echo "$*"; }
 warn() { _pfx; _is_tty && printf "%sWARN%s " "$c_yel" "$c_reset" || printf "WARN "; echo "$*"; }
 err()  { _pfx; _is_tty && printf "%sERROR%s " "$c_red" "$c_reset" || printf "ERROR "; echo "$*"; }
@@ -138,7 +137,6 @@ _logrotate_mode() {
 }
 
 _unattended_reboot_setting() {
-  # returns: "<true|false|-> / <HH:MM|->"
   local reboot time
   reboot="$(grep -Rhs 'Unattended-Upgrade::Automatic-Reboot' /etc/apt/apt.conf.d/*.conf 2>/dev/null \
     | sed -nE 's/.*Automatic-Reboot\s+"([^"]+)".*/\1/p' | tail -n1 || true)"
@@ -192,24 +190,89 @@ snapshot_after() {
 }
 
 ###############################################################################
+# Profile selection helpers (rounding)
+###############################################################################
+# Round MiB to nearest GiB (1 GiB = 1024 MiB)
+round_gib() {
+  local mem_mb="$1"
+  echo $(( (mem_mb + 512) / 1024 ))
+}
+
+# Round CPU cores to nearest tier (1,2,4,8,16,32,64)
+round_cpu_tier() {
+  local c="$1"
+  if   [[ "$c" -le 1  ]]; then echo 1
+  elif [[ "$c" -le 2  ]]; then echo 2
+  elif [[ "$c" -le 4  ]]; then echo 4
+  elif [[ "$c" -le 8  ]]; then echo 8
+  elif [[ "$c" -le 16 ]]; then echo 16
+  elif [[ "$c" -le 32 ]]; then echo 32
+  else echo 64
+  fi
+}
+
+# Map rounded GiB to profile (includes dedicated)
+profile_from_mem_gib() {
+  local g="$1"
+  # "Dedicated" is for very large boxes
+  if   [[ "$g" -ge 32 ]]; then echo "dedicated"
+  elif [[ "$g" -ge 16 ]]; then echo "xhigh"
+  elif [[ "$g" -ge 12 ]]; then echo "high"
+  elif [[ "$g" -ge 2  ]]; then echo "mid"
+  else echo "low"
+  fi
+}
+
+# Map CPU tier to profile
+profile_from_cpu_tier() {
+  local t="$1"
+  if   [[ "$t" -ge 32 ]]; then echo "dedicated"
+  elif [[ "$t" -ge 16 ]]; then echo "xhigh"
+  elif [[ "$t" -ge 8  ]]; then echo "high"
+  elif [[ "$t" -ge 2  ]]; then echo "mid"
+  else echo "low"
+  fi
+}
+
+# max(profileA, profileB) by order: low < mid < high < xhigh < dedicated
+profile_rank() {
+  case "$1" in
+    low) echo 1 ;;
+    mid) echo 2 ;;
+    high) echo 3 ;;
+    xhigh) echo 4 ;;
+    dedicated) echo 5 ;;
+    *) echo 0 ;;
+  esac
+}
+
+profile_max() {
+  local a="$1" b="$2"
+  local ra rb
+  ra="$(profile_rank "$a")"
+  rb="$(profile_rank "$b")"
+  if [[ "$ra" -ge "$rb" ]]; then echo "$a"; else echo "$b"; fi
+}
+
+###############################################################################
 # Output: compact tables
 ###############################################################################
 print_run_table() {
-  local mode="$1" profile="$2" backup="$3"
+  local mode="$1" profile="$2" backup="$3" cpu="$4" mem_mb="$5" mem_gib="$6" cpu_tier="$7"
   echo
   echo "Run"
-  printf "%-10s | %s\n" "Host"   "$(host_short)"
-  printf "%-10s | %s\n" "Mode"   "$mode"
+  printf "%-10s | %s\n" "Host"    "$(host_short)"
+  printf "%-10s | %s\n" "Mode"    "$mode"
+  printf "%-10s | %s (tier %s)\n" "CPU"     "${cpu:-"-"}" "${cpu_tier:-"-"}"
+  printf "%-10s | %s MiB (~%s GiB)\n" "RAM"  "${mem_mb:-"-"}" "${mem_gib:-"-"}"
   printf "%-10s | %s\n" "Profile" "${profile:-"-"}"
-  printf "%-10s | %s\n" "Backup" "${backup:-"-"}"
+  printf "%-10s | %s\n" "Backup"  "${backup:-"-"}"
 }
 
 _print_diff_row() {
-  # label before after; print only if changed
   local label="$1" b="$2" a="$3"
   [[ "$b" == "$a" ]] && return 0
   printf "%-12s | %-24s | %-24s\n" "$label" "$b" "$a"
-  return 0
 }
 
 print_changes_table_diff() {
@@ -236,7 +299,7 @@ print_changes_table_diff() {
   _print_diff_row "Reboot time" "$b_rt" "$a_rt" && [[ "$b_rt" != "$a_rt" ]] && printed=1 || true
 
   if [[ "$printed" -eq 0 ]]; then
-    echo "(no changes — already tuned)"
+    echo "(no changes - already tuned)"
   fi
 }
 
@@ -285,7 +348,6 @@ apply_cmd() {
   mkbackup
   _APPLY_CREATED_BACKUP="1"
 
-  # BEFORE snapshot
   snapshot_before
 
   # Discover resources
@@ -294,16 +356,19 @@ apply_cmd() {
   mem_mb="$((mem_kb / 1024))"
   cpu="$(nproc)"
 
-  # Choose profile
-  local profile="xhigh"
-  if [[ "$cpu" -le 1 || "$mem_mb" -lt 2048 ]]; then
-    profile="low"
-  elif [[ "$mem_mb" -lt 8192 ]]; then
-    profile="mid"
-  elif [[ "$mem_mb" -lt 12288 ]]; then
-    profile="high"
-  fi
-  if [[ "${FORCE_PROFILE:-}" =~ ^(low|mid|high|xhigh)$ ]]; then
+  # Rounded "plans"
+  local mem_gib cpu_tier
+  mem_gib="$(round_gib "$mem_mb")"
+  cpu_tier="$(round_cpu_tier "$cpu")"
+
+  # Choose profile from rounded memory + rounded CPU, then take max
+  local p_mem p_cpu profile
+  p_mem="$(profile_from_mem_gib "$mem_gib")"
+  p_cpu="$(profile_from_cpu_tier "$cpu_tier")"
+  profile="$(profile_max "$p_mem" "$p_cpu")"
+
+  # Manual override
+  if [[ "${FORCE_PROFILE:-}" =~ ^(low|mid|high|xhigh|dedicated)$ ]]; then
     profile="${FORCE_PROFILE}"
   fi
 
@@ -314,8 +379,8 @@ apply_cmd() {
   case "$profile" in
     low)
       somaxconn=4096;  netdev_backlog=16384;  syn_backlog=4096
-      rmem_max=$((32*1024*1024)); wmem_max=$((32*1024*1024))
-      rmem_def=$((8*1024*1024));  wmem_def=$((8*1024*1024))
+      rmem_max=$((32*1024*1024));  wmem_max=$((32*1024*1024))
+      rmem_def=$((8*1024*1024));   wmem_def=$((8*1024*1024))
       tcp_rmem="4096 262144 ${rmem_max}"
       tcp_wmem="4096 262144 ${wmem_max}"
       ct_max=32768
@@ -327,8 +392,8 @@ apply_cmd() {
       ;;
     mid)
       somaxconn=16384; netdev_backlog=65536;  syn_backlog=16384
-      rmem_max=$((64*1024*1024)); wmem_max=$((64*1024*1024))
-      rmem_def=$((16*1024*1024)); wmem_def=$((16*1024*1024))
+      rmem_max=$((64*1024*1024));  wmem_max=$((64*1024*1024))
+      rmem_def=$((16*1024*1024));  wmem_def=$((16*1024*1024))
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
       ct_max=131072
@@ -341,7 +406,7 @@ apply_cmd() {
     high)
       somaxconn=65535; netdev_backlog=131072; syn_backlog=65535
       rmem_max=$((128*1024*1024)); wmem_max=$((128*1024*1024))
-      rmem_def=$((32*1024*1024)); wmem_def=$((32*1024*1024))
+      rmem_def=$((32*1024*1024));  wmem_def=$((32*1024*1024))
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
       ct_max=262144
@@ -354,7 +419,7 @@ apply_cmd() {
     xhigh)
       somaxconn=65535; netdev_backlog=250000; syn_backlog=65535
       rmem_max=$((256*1024*1024)); wmem_max=$((256*1024*1024))
-      rmem_def=$((64*1024*1024)); wmem_def=$((64*1024*1024))
+      rmem_def=$((64*1024*1024));  wmem_def=$((64*1024*1024))
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
       ct_max=1048576
@@ -363,6 +428,19 @@ apply_cmd() {
       tw_buckets=300000
       j_system="400M"; j_runtime="200M"
       logrotate_rotate=21
+      ;;
+    dedicated)
+      somaxconn=65535; netdev_backlog=500000; syn_backlog=65535
+      rmem_max=$((512*1024*1024)); wmem_max=$((512*1024*1024))
+      rmem_def=$((128*1024*1024)); wmem_def=$((128*1024*1024))
+      tcp_rmem="4096 87380 ${rmem_max}"
+      tcp_wmem="4096 65536 ${wmem_max}"
+      ct_max=2097152
+      swappiness=10
+      nofile=2097152
+      tw_buckets=600000
+      j_system="800M"; j_runtime="400M"
+      logrotate_rotate=30
       ;;
   esac
 
@@ -613,12 +691,10 @@ EOM
   systemd-tmpfiles --create >/dev/null 2>&1 || true
 
   trap - ERR
-
-  # AFTER snapshot + compact output
   snapshot_after
 
   ok "Applied. Backup: $backup_dir"
-  print_run_table "apply" "$profile" "$backup_dir"
+  print_run_table "apply" "$profile" "$backup_dir" "$cpu" "$mem_mb" "$mem_gib" "$cpu_tier"
   print_changes_table_diff
   print_manifest_compact "$manifest"
   echo "BACKUP_DIR=$backup_dir"
@@ -663,25 +739,25 @@ rollback_cmd() {
   snapshot_after
 
   ok "Rolled back. Backup used: $backup"
-  print_run_table "rollback" "-" "$backup"
+  # CPU/RAM unknown here (rollback doesn't re-detect on purpose)
+  print_run_table "rollback" "-" "$backup" "-" "-" "-" "-"
   print_changes_table_diff
   print_manifest_compact "$man"
 }
 
 status_cmd() {
   snapshot_before
-  # just show current (no diff)
   echo
   echo "Current"
-  printf "%-12s | %s\n" "Host"      "$(host_short)"
-  printf "%-12s | %s\n" "TCP"       "$B_TCP_CC"
-  printf "%-12s | %s\n" "Qdisc"     "$B_QDISC"
-  printf "%-12s | %s\n" "Forward"   "$B_FWD"
-  printf "%-12s | %s\n" "Conntrack" "$B_CT_MAX"
-  printf "%-12s | %s\n" "Swap"      "$B_SWAP"
-  printf "%-12s | %s\n" "Nofile"    "$B_NOFILE"
-  printf "%-12s | %s\n" "Journald"  "$B_JOURNAL"
-  printf "%-12s | %s\n" "Logrotate" "$B_LOGROT"
+  printf "%-12s | %s\n" "Host"       "$(host_short)"
+  printf "%-12s | %s\n" "TCP"        "$B_TCP_CC"
+  printf "%-12s | %s\n" "Qdisc"      "$B_QDISC"
+  printf "%-12s | %s\n" "Forward"    "$B_FWD"
+  printf "%-12s | %s\n" "Conntrack"  "$B_CT_MAX"
+  printf "%-12s | %s\n" "Swap"       "$B_SWAP"
+  printf "%-12s | %s\n" "Nofile"     "$B_NOFILE"
+  printf "%-12s | %s\n" "Journald"   "$B_JOURNAL"
+  printf "%-12s | %s\n" "Logrotate"  "$B_LOGROT"
   printf "%-12s | %s\n" "AutoReboot" "$(_unattended_state "$B_UNATT")"
   printf "%-12s | %s\n" "RebootTime" "$(_unattended_time "$B_UNATT")"
 }
