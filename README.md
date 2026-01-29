@@ -2,8 +2,8 @@
 
 ## TL;DR
 
-Safe one-command tuning for new Linux VPS with many connections.
-Automatically selects a profile, creates a backup, and can be fully rolled back.
+One command to tune a fresh Linux VPS for lots of concurrent connections.
+It auto-picks a profile, makes a backup, and you can roll everything back.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | sudo bash -s -- apply
@@ -11,51 +11,27 @@ curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script
 
 ---
 
-## What this script does
+## What it does
 
-This script prepares a fresh VPS for high connection load:
+- Enables BBR + fq
+- Raises network and connection limits for high-connection workloads
+- Enables IP forwarding
+- Tunes conntrack for many concurrent connections
+- Sets higher NOFILE limits
+- Creates or resizes /swapfile if needed
+- Limits journald disk usage
+- Configures logrotate
+- Disables unattended-upgrades auto reboot
 
-- enables **BBR + fq**
-- increases network buffers and connection limits
-- enables IP forwarding
-- configures **conntrack** for many concurrent connections
-- sets sane **NOFILE** limits
-- creates or resizes **/swapfile** if needed
-- limits **journald** disk usage
-- configures **logrotate**
-- disables automatic reboots from unattended upgrades
-
-Everything is applied **safely** and **reversibly**.
-
----
-
-## Automatic profiles
-
-The script automatically selects a profile based on CPU and RAM.
-
-### Profiles overview
-
-| Profile | Typical VPS size        | Conntrack max | NOFILE | Swap |
-|--------|--------------------------|---------------|--------|------|
-| low    | 1 CPU, < 2 GB RAM        | 32K           | 65K    | 1 GB |
-| mid    | 2-4 CPU, 2-8 GB RAM      | 131K          | 262K   | 2-4 GB |
-| high   | 4-8 CPU, 8-12 GB RAM     | 262K          | 524K   | 4-6 GB |
-| xhigh  | 8+ CPU, 16+ GB RAM       | 1M            | 1M     | 8 GB |
-
-The profile is chosen automatically.
-You can override it manually if needed:
-
-```bash
-FORCE_PROFILE=high sudo bash initial.sh apply
-```
+Everything is applied safely and is reversible with rollback.
 
 ---
 
 ## Commands
 
-- **apply** - tune the system and create a backup
-- **rollback** - revert all changes using a backup
-- **status** - show current tuning state
+- apply - apply tuning and create a backup
+- rollback - undo changes using a backup
+- status - show current tuning state
 
 Examples:
 
@@ -65,7 +41,7 @@ sudo bash initial.sh rollback
 sudo bash initial.sh status
 ```
 
-When using `curl | bash`:
+Using curl:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | sudo bash -s -- apply
@@ -73,36 +49,74 @@ curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script
 
 ---
 
+## Automatic profiles
+
+The script detects CPU cores and RAM, then rounds them to common "plan" sizes:
+
+- RAM: rounded to nearest GiB (1024 MiB)
+- CPU: rounded to nearest tier (1, 2, 4, 8, 16, 32, 64)
+
+Then it picks a profile from RAM and CPU and uses the larger one (so you do not get an underpowered profile).
+
+You can override manually:
+
+```bash
+FORCE_PROFILE=high sudo bash initial.sh apply
+```
+
+Supported values: low, mid, high, xhigh, dedicated
+
+---
+
+## Profiles table
+
+This table shows the main limits per profile (the most important knobs for many connections).
+
+| Profile   | Typical VPS size           | Conntrack max | NOFILE   | Swap   |
+|-----------|----------------------------|---------------|----------|--------|
+| low       | 1 CPU, ~1 GiB RAM          | 32K           | 65K      | 1 GB   |
+| mid       | 2-4 CPU, ~2-8 GiB RAM      | 131K          | 262K     | 2-4 GB |
+| high      | 4-8 CPU, ~12 GiB RAM       | 262K          | 524K     | 4-6 GB |
+| xhigh     | 16+ CPU, ~16-31 GiB RAM    | 1M            | 1M       | 8 GB   |
+| dedicated | 32+ CPU, 32+ GiB RAM       | 2M            | 2M       | 8 GB   |
+
+Note: swap is only created/managed if there is no swap partition. If a swap partition exists, the script does not touch it.
+
+---
+
 ## Backups and rollback
 
-Each run creates a backup directory:
+Each apply creates a backup folder:
 
 ```
 /root/edge-tuning-backup-YYYYMMDD-HHMMSS
 ```
 
-It contains:
-- original config files
-- moved conflicting configs
-- a manifest for exact restore
+It includes:
+- copies of original files
+- any conflicting configs moved aside
+- MANIFEST.tsv for exact restore
 
-Rollback example:
+Rollback (latest backup):
+
+```bash
+sudo bash initial.sh rollback
+```
+
+Rollback (specific backup):
 
 ```bash
 sudo BACKUP_DIR=/root/edge-tuning-backup-YYYYMMDD-HHMMSS bash initial.sh rollback
 ```
-
-If BACKUP_DIR is not set, the latest backup is used.
 
 ---
 
 ## When NOT to use
 
 Do NOT use this script if:
-
-- the server is a database with strict latency requirements
-- you already have carefully hand-tuned kernel parameters
-- the system is not a VPS (for example, embedded devices)
+- this is a database server with strict latency requirements
+- you already have careful custom kernel tuning you want to keep
+- this is not a VPS/server (for example, embedded systems)
 
 ---
 
