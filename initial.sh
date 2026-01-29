@@ -190,90 +190,126 @@ snapshot_after() {
 }
 
 ###############################################################################
-# Profile selection helpers (rounding)
+# Tiered selection (RAM + CPU), and disk-aware logging caps
 ###############################################################################
-# Round MiB to nearest GiB (1 GiB = 1024 MiB)
-round_gib() {
-  local mem_mb="$1"
-  echo $(( (mem_mb + 512) / 1024 ))
-}
+# Tiers: 1/2/4/8/16/32/64+
+ceil_gib() { local mem_mb="$1"; echo $(( (mem_mb + 1023) / 1024 )); }
 
-# Round CPU cores to nearest tier (1,2,4,8,16,32,64)
-round_cpu_tier() {
-  local c="$1"
-  if   [[ "$c" -le 1  ]]; then echo 1
-  elif [[ "$c" -le 2  ]]; then echo 2
-  elif [[ "$c" -le 4  ]]; then echo 4
-  elif [[ "$c" -le 8  ]]; then echo 8
-  elif [[ "$c" -le 16 ]]; then echo 16
-  elif [[ "$c" -le 32 ]]; then echo 32
+ceil_to_tier() {
+  local x="$1"
+  if   [[ "$x" -le 1  ]]; then echo 1
+  elif [[ "$x" -le 2  ]]; then echo 2
+  elif [[ "$x" -le 4  ]]; then echo 4
+  elif [[ "$x" -le 8  ]]; then echo 8
+  elif [[ "$x" -le 16 ]]; then echo 16
+  elif [[ "$x" -le 32 ]]; then echo 32
   else echo 64
   fi
 }
 
-# Map rounded GiB to profile (includes dedicated)
-profile_from_mem_gib() {
-  local g="$1"
-  # "Dedicated" is for very large boxes
-  if   [[ "$g" -ge 32 ]]; then echo "dedicated"
-  elif [[ "$g" -ge 16 ]]; then echo "xhigh"
-  elif [[ "$g" -ge 12 ]]; then echo "high"
-  elif [[ "$g" -ge 2  ]]; then echo "mid"
-  else echo "low"
-  fi
-}
-
-# Map CPU tier to profile
-profile_from_cpu_tier() {
+profile_from_tier() {
   local t="$1"
-  if   [[ "$t" -ge 32 ]]; then echo "dedicated"
-  elif [[ "$t" -ge 16 ]]; then echo "xhigh"
-  elif [[ "$t" -ge 8  ]]; then echo "high"
-  elif [[ "$t" -ge 2  ]]; then echo "mid"
-  else echo "low"
-  fi
-}
-
-# max(profileA, profileB) by order: low < mid < high < xhigh < dedicated
-profile_rank() {
-  case "$1" in
-    low) echo 1 ;;
-    mid) echo 2 ;;
-    high) echo 3 ;;
-    xhigh) echo 4 ;;
-    dedicated) echo 5 ;;
-    *) echo 0 ;;
+  case "$t" in
+    1)  echo "low" ;;
+    2)  echo "mid" ;;
+    4)  echo "high" ;;
+    8)  echo "xhigh" ;;
+    16) echo "2xhigh" ;;
+    32) echo "dedicated" ;;
+    *)  echo "dedicated+" ;; # 64+
   esac
 }
 
-profile_max() {
+tier_rank() {
+  case "$1" in
+    1) echo 1 ;;
+    2) echo 2 ;;
+    4) echo 3 ;;
+    8) echo 4 ;;
+    16) echo 5 ;;
+    32) echo 6 ;;
+    *) echo 7 ;;
+  esac
+}
+tier_max() {
   local a="$1" b="$2"
   local ra rb
-  ra="$(profile_rank "$a")"
-  rb="$(profile_rank "$b")"
+  ra="$(tier_rank "$a")"; rb="$(tier_rank "$b")"
   if [[ "$ra" -ge "$rb" ]]; then echo "$a"; else echo "$b"; fi
 }
 
-###############################################################################
-# Output: compact tables
-###############################################################################
-print_run_table() {
-  local mode="$1" profile="$2" backup="$3" cpu="$4" mem_mb="$5" mem_gib="$6" cpu_tier="$7"
-  echo
-  echo "Run"
-  printf "%-10s | %s\n" "Host"    "$(host_short)"
-  printf "%-10s | %s\n" "Mode"    "$mode"
-  printf "%-10s | %s (tier %s)\n" "CPU"     "${cpu:-"-"}" "${cpu_tier:-"-"}"
-  printf "%-10s | %s MiB (~%s GiB)\n" "RAM"  "${mem_mb:-"-"}" "${mem_gib:-"-"}"
-  printf "%-10s | %s\n" "Profile" "${profile:-"-"}"
-  printf "%-10s | %s\n" "Backup"  "${backup:-"-"}"
+clamp() { local v="$1" lo="$2" hi="$3"; [[ "$v" -lt "$lo" ]] && v="$lo"; [[ "$v" -gt "$hi" ]] && v="$hi"; echo "$v"; }
+
+# Conntrack: soft by RAM + small CPU bonus (gentle, not explosive)
+# base: RAM_MiB * 32  (1 GiB -> 32768, 2 GiB -> 65536, 4 GiB -> 131072, ...)
+# bonus: CPU * 4096   (16 cores adds 65536)
+ct_soft_from_ram_cpu() {
+  local mem_mb="$1" cpu="$2"
+  local ct=$(( mem_mb * 32 + cpu * 4096 ))
+  [[ "$ct" -lt 32768 ]] && ct=32768
+  echo "$ct"
 }
 
-_print_diff_row() {
-  local label="$1" b="$2" a="$3"
-  [[ "$b" == "$a" ]] && return 0
-  printf "%-12s | %-24s | %-24s\n" "$label" "$b" "$a"
+# Disk size (MB) for /var/log (fallback to /)
+disk_size_mb_for_logs() {
+  local mb=""
+  mb="$(df -Pm /var/log 2>/dev/null | awk 'NR==2{print $2}' || true)"
+  [[ -n "$mb" ]] || mb="$(df -Pm / 2>/dev/null | awk 'NR==2{print $2}' || true)"
+  [[ -n "$mb" ]] || mb="0"
+  echo "$mb"
 }
+
+# Pick journald caps + logrotate rotate based on disk size (keep logs minimal on small disks)
+pick_log_caps() {
+  local disk_mb="$1"
+
+  # defaults
+  J_SYSTEM="100M"
+  J_RUNTIME="50M"
+  LR_ROTATE="7"
+
+  if [[ "$disk_mb" -lt 15000 ]]; then
+    # < 15 GB: minimal
+    J_SYSTEM="80M";  J_RUNTIME="40M";  LR_ROTATE="5"
+  elif [[ "$disk_mb" -lt 30000 ]]; then
+    # 15-30 GB
+    J_SYSTEM="120M"; J_RUNTIME="60M";  LR_ROTATE="7"
+  elif [[ "$disk_mb" -lt 60000 ]]; then
+    # 30-60 GB
+    J_SYSTEM="200M"; J_RUNTIME="100M"; LR_ROTATE="10"
+  elif [[ "$disk_mb" -lt 120000 ]]; then
+    # 60-120 GB
+    J_SYSTEM="300M"; J_RUNTIME="150M"; LR_ROTATE="14"
+  else
+    # big disks
+    J_SYSTEM="400M"; J_RUNTIME="200M"; LR_ROTATE="21"
+  fi
+}
+
+###############################################################################
+# Output tables
+###############################################################################
+print_run_table() {
+  local mode="$1" profile="$2" backup="$3"
+  local cpu="$4" mem_mb="$5" gib="$6"
+  local ram_tier="$7" cpu_tier="$8" tier="$9"
+  local disk_mb="${10}" jcap="${11}" lrrot="${12}"
+
+  echo
+  echo "Run"
+  printf "%-12s | %s\n" "Host"        "$(host_short)"
+  printf "%-12s | %s\n" "Mode"        "$mode"
+  printf "%-12s | %s\n" "CPU"         "${cpu:-"-"}"
+  printf "%-12s | %s MiB (~%s GiB)\n" "RAM" "${mem_mb:-"-"}" "${gib:-"-"}"
+  printf "%-12s | %s MB\n" "Disk(/var)" "${disk_mb:-"-"}"
+  printf "%-12s | %s (RAM %s / CPU %s)\n" "Tier" "${tier:-"-"}" "${ram_tier:-"-"}" "${cpu_tier:-"-"}"
+  printf "%-12s | %s\n" "Profile"     "${profile:-"-"}"
+  printf "%-12s | %s\n" "Journald cap" "${jcap:-"-"}"
+  printf "%-12s | rotate %s\n" "Logrotate" "${lrrot:-"-"}"
+  printf "%-12s | %s\n" "Backup"      "${backup:-"-"}"
+}
+
+_print_diff_row() { local label="$1" b="$2" a="$3"; [[ "$b" == "$a" ]] && return 0; printf "%-12s | %-24s | %-24s\n" "$label" "$b" "$a"; }
 
 print_changes_table_diff() {
   echo
@@ -281,32 +317,30 @@ print_changes_table_diff() {
   printf "%-12s-+-%-24s-+-%-24s\n" "$(printf '%.0s-' {1..12})" "$(printf '%.0s-' {1..24})" "$(printf '%.0s-' {1..24})"
 
   local printed=0
-  _print_diff_row "TCP"        "$B_TCP_CC" "$A_TCP_CC" && [[ "$B_TCP_CC" != "$A_TCP_CC" ]] && printed=1 || true
-  _print_diff_row "Qdisc"      "$B_QDISC" "$A_QDISC" && [[ "$B_QDISC" != "$A_QDISC" ]] && printed=1 || true
-  _print_diff_row "Forward"    "$B_FWD" "$A_FWD" && [[ "$B_FWD" != "$A_FWD" ]] && printed=1 || true
-  _print_diff_row "Conntrack"  "$B_CT_MAX" "$A_CT_MAX" && [[ "$B_CT_MAX" != "$A_CT_MAX" ]] && printed=1 || true
-  _print_diff_row "TW buckets" "$B_TW" "$A_TW" && [[ "$B_TW" != "$A_TW" ]] && printed=1 || true
-  _print_diff_row "Swappiness" "$B_SWAPPINESS" "$A_SWAPPINESS" && [[ "$B_SWAPPINESS" != "$A_SWAPPINESS" ]] && printed=1 || true
-  _print_diff_row "Swap"       "$B_SWAP" "$A_SWAP" && [[ "$B_SWAP" != "$A_SWAP" ]] && printed=1 || true
-  _print_diff_row "Nofile"     "$B_NOFILE" "$A_NOFILE" && [[ "$B_NOFILE" != "$A_NOFILE" ]] && printed=1 || true
-  _print_diff_row "Journald"   "$B_JOURNAL" "$A_JOURNAL" && [[ "$B_JOURNAL" != "$A_JOURNAL" ]] && printed=1 || true
-  _print_diff_row "Logrotate"  "$B_LOGROT" "$A_LOGROT" && [[ "$B_LOGROT" != "$A_LOGROT" ]] && printed=1 || true
+  _print_diff_row "TCP"        "$B_TCP_CC" "$A_TCP_CC" && printed=1 || true
+  _print_diff_row "Qdisc"      "$B_QDISC" "$A_QDISC" && printed=1 || true
+  _print_diff_row "Forward"    "$B_FWD" "$A_FWD" && printed=1 || true
+  _print_diff_row "Conntrack"  "$B_CT_MAX" "$A_CT_MAX" && printed=1 || true
+  _print_diff_row "TW buckets" "$B_TW" "$A_TW" && printed=1 || true
+  _print_diff_row "Swappiness" "$B_SWAPPINESS" "$A_SWAPPINESS" && printed=1 || true
+  _print_diff_row "Swap"       "$B_SWAP" "$A_SWAP" && printed=1 || true
+  _print_diff_row "Nofile"     "$B_NOFILE" "$A_NOFILE" && printed=1 || true
+  _print_diff_row "Journald"   "$B_JOURNAL" "$A_JOURNAL" && printed=1 || true
+  _print_diff_row "Logrotate"  "$B_LOGROT" "$A_LOGROT" && printed=1 || true
 
+  # Always show reboot-related rows (so you always see them)
   local b_ar b_rt a_ar a_rt
   b_ar="$(_unattended_state "$B_UNATT")"; b_rt="$(_unattended_time "$B_UNATT")"
   a_ar="$(_unattended_state "$A_UNATT")"; a_rt="$(_unattended_time "$A_UNATT")"
-  _print_diff_row "Auto reboot" "$b_ar" "$a_ar" && [[ "$b_ar" != "$a_ar" ]] && printed=1 || true
-  _print_diff_row "Reboot time" "$b_rt" "$a_rt" && [[ "$b_rt" != "$a_rt" ]] && printed=1 || true
+  printf "%-12s | %-24s | %-24s\n" "Auto reboot" "$b_ar" "$a_ar"
+  printf "%-12s | %-24s | %-24s\n" "Reboot time" "$b_rt" "$a_rt"
 
-  if [[ "$printed" -eq 0 ]]; then
-    echo "(no changes - already tuned)"
-  fi
+  [[ "$printed" -eq 0 ]] && echo "(no changes - already tuned)"
 }
 
 print_manifest_compact() {
   local man="$1"
   [[ -f "$man" ]] || return 0
-
   local copies moves
   copies="$(awk -F'\t' '$1=="COPY"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
   moves="$(awk -F'\t' '$1=="MOVE"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
@@ -356,25 +390,30 @@ apply_cmd() {
   mem_mb="$((mem_kb / 1024))"
   cpu="$(nproc)"
 
-  # Rounded "plans"
-  local mem_gib cpu_tier
-  mem_gib="$(round_gib "$mem_mb")"
-  cpu_tier="$(round_cpu_tier "$cpu")"
+  local disk_mb
+  disk_mb="$(disk_size_mb_for_logs)"
 
-  # Choose profile from rounded memory + rounded CPU, then take max
-  local p_mem p_cpu profile
-  p_mem="$(profile_from_mem_gib "$mem_gib")"
-  p_cpu="$(profile_from_cpu_tier "$cpu_tier")"
-  profile="$(profile_max "$p_mem" "$p_cpu")"
+  # Tiers
+  local gib ram_tier cpu_tier tier profile
+  gib="$(ceil_gib "$mem_mb")"
+  ram_tier="$(ceil_to_tier "$gib")"
+  cpu_tier="$(ceil_to_tier "$cpu")"
+  tier="$(tier_max "$ram_tier" "$cpu_tier")"
+  profile="$(profile_from_tier "$tier")"
 
   # Manual override
-  if [[ "${FORCE_PROFILE:-}" =~ ^(low|mid|high|xhigh|dedicated)$ ]]; then
+  if [[ "${FORCE_PROFILE:-}" =~ ^(low|mid|high|xhigh|2xhigh|dedicated|dedicated\+)$ ]]; then
     profile="${FORCE_PROFILE}"
   fi
 
-  # Profile defaults
+  # Disk-aware log caps
+  pick_log_caps "$disk_mb"
+  local j_system="$J_SYSTEM" j_runtime="$J_RUNTIME" logrotate_rotate="$LR_ROTATE"
+
+  # Defaults by profile (network + limits)
   local somaxconn netdev_backlog syn_backlog rmem_max wmem_max rmem_def wmem_def tcp_rmem tcp_wmem
-  local ct_max swappiness nofile tw_buckets j_system j_runtime logrotate_rotate
+  local swappiness nofile tw_buckets
+  local ct_min ct_cap
 
   case "$profile" in
     low)
@@ -383,12 +422,10 @@ apply_cmd() {
       rmem_def=$((8*1024*1024));   wmem_def=$((8*1024*1024))
       tcp_rmem="4096 262144 ${rmem_max}"
       tcp_wmem="4096 262144 ${wmem_max}"
-      ct_max=32768
       swappiness=5
       nofile=65536
       tw_buckets=50000
-      j_system="100M"; j_runtime="50M"
-      logrotate_rotate=7
+      ct_min=32768;   ct_cap=65536
       ;;
     mid)
       somaxconn=16384; netdev_backlog=65536;  syn_backlog=16384
@@ -396,12 +433,10 @@ apply_cmd() {
       rmem_def=$((16*1024*1024));  wmem_def=$((16*1024*1024))
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
-      ct_max=131072
       swappiness=10
-      nofile=262144
-      tw_buckets=120000
-      j_system="200M"; j_runtime="100M"
-      logrotate_rotate=10
+      nofile=131072
+      tw_buckets=90000
+      ct_min=65536;   ct_cap=131072
       ;;
     high)
       somaxconn=65535; netdev_backlog=131072; syn_backlog=65535
@@ -409,12 +444,10 @@ apply_cmd() {
       rmem_def=$((32*1024*1024));  wmem_def=$((32*1024*1024))
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
-      ct_max=262144
       swappiness=10
-      nofile=524288
-      tw_buckets=200000
-      j_system="300M"; j_runtime="150M"
-      logrotate_rotate=14
+      nofile=262144
+      tw_buckets=150000
+      ct_min=131072;  ct_cap=262144
       ;;
     xhigh)
       somaxconn=65535; netdev_backlog=250000; syn_backlog=65535
@@ -422,12 +455,21 @@ apply_cmd() {
       rmem_def=$((64*1024*1024));  wmem_def=$((64*1024*1024))
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
-      ct_max=1048576
+      swappiness=10
+      nofile=524288
+      tw_buckets=250000
+      ct_min=262144;  ct_cap=524288
+      ;;
+    2xhigh)
+      somaxconn=65535; netdev_backlog=350000; syn_backlog=65535
+      rmem_max=$((384*1024*1024)); wmem_max=$((384*1024*1024))
+      rmem_def=$((96*1024*1024));  wmem_def=$((96*1024*1024))
+      tcp_rmem="4096 87380 ${rmem_max}"
+      tcp_wmem="4096 65536 ${wmem_max}"
       swappiness=10
       nofile=1048576
-      tw_buckets=300000
-      j_system="400M"; j_runtime="200M"
-      logrotate_rotate=21
+      tw_buckets=350000
+      ct_min=524288;  ct_cap=1048576
       ;;
     dedicated)
       somaxconn=65535; netdev_backlog=500000; syn_backlog=65535
@@ -435,18 +477,31 @@ apply_cmd() {
       rmem_def=$((128*1024*1024)); wmem_def=$((128*1024*1024))
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
-      ct_max=2097152
       swappiness=10
       nofile=2097152
       tw_buckets=600000
-      j_system="800M"; j_runtime="400M"
-      logrotate_rotate=30
+      ct_min=1048576; ct_cap=2097152
+      ;;
+    dedicated+)
+      somaxconn=65535; netdev_backlog=700000; syn_backlog=65535
+      rmem_max=$((768*1024*1024)); wmem_max=$((768*1024*1024))
+      rmem_def=$((192*1024*1024)); wmem_def=$((192*1024*1024))
+      tcp_rmem="4096 87380 ${rmem_max}"
+      tcp_wmem="4096 65536 ${wmem_max}"
+      swappiness=10
+      nofile=4194304
+      tw_buckets=900000
+      ct_min=2097152; ct_cap=4194304
       ;;
   esac
 
+  # Conntrack: soft by RAM+CPU, clamped per profile
+  local ct_soft ct_max
+  ct_soft="$(ct_soft_from_ram_cpu "$mem_mb" "$cpu")"
+  ct_max="$(clamp "$ct_soft" "$ct_min" "$ct_cap")"
   local ct_buckets=$((ct_max/4)); [[ "$ct_buckets" -lt 4096 ]] && ct_buckets=4096
 
-  # Swap sizing
+  # Swap sizing (kept simple; only if no swap partition)
   backup_file /etc/fstab
   local swap_gb=2
   if   [[ "$mem_mb" -lt 2048  ]]; then swap_gb=1
@@ -601,7 +656,7 @@ EOM
 
   systemctl daemon-reexec >/dev/null 2>&1 || true
 
-  # journald
+  # journald (disk-aware)
   mkdir -p /etc/systemd/journald.conf.d
   shopt -s nullglob
   for f in /etc/systemd/journald.conf.d/*.conf; do
@@ -633,7 +688,7 @@ EOM
     systemctl enable --now irqbalance >/dev/null 2>&1 || true
   fi
 
-  # logrotate
+  # logrotate (disk-aware rotate count)
   backup_file /etc/logrotate.conf
   cat > /etc/logrotate.conf <<EOM
 daily
@@ -694,7 +749,7 @@ EOM
   snapshot_after
 
   ok "Applied. Backup: $backup_dir"
-  print_run_table "apply" "$profile" "$backup_dir" "$cpu" "$mem_mb" "$mem_gib" "$cpu_tier"
+  print_run_table "apply" "$profile" "$backup_dir" "$cpu" "$mem_mb" "$gib" "$ram_tier" "$cpu_tier" "$tier" "$disk_mb" "${j_system}/${j_runtime}" "$logrotate_rotate"
   print_changes_table_diff
   print_manifest_compact "$manifest"
   echo "BACKUP_DIR=$backup_dir"
@@ -708,7 +763,6 @@ rollback_cmd() {
   [[ -n "$backup" && -d "$backup" ]] || die "Backup not found. Set BACKUP_DIR=/root/edge-tuning-backup-... or run apply first."
 
   local man="${backup}/MANIFEST.tsv"
-
   snapshot_before
 
   rm -f /etc/sysctl.d/90-edge-network.conf \
@@ -739,8 +793,12 @@ rollback_cmd() {
   snapshot_after
 
   ok "Rolled back. Backup used: $backup"
-  # CPU/RAM unknown here (rollback doesn't re-detect on purpose)
-  print_run_table "rollback" "-" "$backup" "-" "-" "-" "-"
+  # compact rollback run info (no recalculation)
+  echo
+  echo "Run"
+  printf "%-12s | %s\n" "Host"  "$(host_short)"
+  printf "%-12s | %s\n" "Mode"  "rollback"
+  printf "%-12s | %s\n" "Backup" "$backup"
   print_changes_table_diff
   print_manifest_compact "$man"
 }
