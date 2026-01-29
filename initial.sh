@@ -47,13 +47,11 @@ need_root() {
 host_short() { hostname -s 2>/dev/null || hostname; }
 
 ###############################################################################
-# optional confirmation (OFF by default)
+# confirmation (OFF by default)
 ###############################################################################
 confirm() {
-  # default: no prompt at all
+  # never prompt by default; enable only if EDGE_CONFIRM=1 and stdin is a tty
   [[ "${EDGE_CONFIRM:-0}" == "1" ]] || return 0
-
-  # if there is no stdin tty, don't block
   [[ -t 0 ]] || return 0
 
   echo
@@ -141,7 +139,137 @@ latest_backup_dir() {
 }
 
 ###############################################################################
-# summary
+# state snapshots (for nice table output)
+###############################################################################
+_journald_caps() {
+  local f="/etc/systemd/journald.conf.d/90-edge.conf"
+  if [[ -f "$f" ]]; then
+    local s r
+    s="$(awk -F= '/^\s*SystemMaxUse=/{print $2}' "$f" | tr -d ' ' | head -n1)"
+    r="$(awk -F= '/^\s*RuntimeMaxUse=/{print $2}' "$f" | tr -d ' ' | head -n1)"
+    [[ -n "$s" || -n "$r" ]] && echo "${s:-?}/${r:-?}" && return 0
+  fi
+  echo "-"
+}
+
+_logrotate_mode() {
+  local f="/etc/logrotate.conf"
+  [[ -f "$f" ]] || { echo "-"; return 0; }
+  local freq rot
+  freq="$(awk 'tolower($1)=="daily"||tolower($1)=="weekly"||tolower($1)=="monthly"{print tolower($1); exit}' "$f" 2>/dev/null || true)"
+  rot="$(awk 'tolower($1)=="rotate"{print $2; exit}' "$f" 2>/dev/null || true)"
+  echo "${freq:-?} / rotate ${rot:-?}"
+}
+
+_unattended_reboot_setting() {
+  local s
+  s="$(grep -R --no-messages -h 'Unattended-Upgrade::Automatic-Reboot' /etc/apt/apt.conf.d/*.conf 2>/dev/null | tr -d ' ' | tr '\n' '|' | sed 's/|$//' || true)"
+  echo "${s:--}"
+}
+
+_swap_state() {
+  local s
+  s="$(/sbin/swapon --noheadings --show=NAME,SIZE 2>/dev/null | awk '{$1=$1; print}' | tr '\n' ';' | sed 's/;$//' || true)"
+  [[ -n "$s" ]] && echo "$s" || echo "none"
+}
+
+_nofile_systemd() {
+  local n
+  n="$(systemctl show --property DefaultLimitNOFILE 2>/dev/null | cut -d= -f2 || true)"
+  echo "${n:--}"
+}
+
+snapshot_before() {
+  B_TCP_CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '-')"
+  B_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '-')"
+  B_FWD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '-')"
+  B_CT_MAX="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo '-')"
+  B_TW="$(sysctl -n net.ipv4.tcp_max_tw_buckets 2>/dev/null || echo '-')"
+  B_SWAPPINESS="$(sysctl -n vm.swappiness 2>/dev/null || echo '-')"
+  B_SWAP="$(_swap_state)"
+  B_NOFILE="$(_nofile_systemd)"
+  B_JOURNAL="$(_journald_caps)"
+  B_LOGROT="$(_logrotate_mode)"
+  B_UNATT="$(_unattended_reboot_setting)"
+}
+
+snapshot_after() {
+  A_TCP_CC="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '-')"
+  A_QDISC="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '-')"
+  A_FWD="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '-')"
+  A_CT_MAX="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo '-')"
+  A_TW="$(sysctl -n net.ipv4.tcp_max_tw_buckets 2>/dev/null || echo '-')"
+  A_SWAPPINESS="$(sysctl -n vm.swappiness 2>/dev/null || echo '-')"
+  A_SWAP="$(_swap_state)"
+  A_NOFILE="$(_nofile_systemd)"
+  A_JOURNAL="$(_journald_caps)"
+  A_LOGROT="$(_logrotate_mode)"
+  A_UNATT="$(_unattended_reboot_setting)"
+}
+
+###############################################################################
+# pretty output: tables
+###############################################################################
+_print_table_row() {
+  # args: label before after
+  printf "%-20s | %-34s | %-34s\n" "$1" "$2" "$3"
+}
+
+print_changes_table() {
+  echo
+  echo "Changes summary (before -> after)"
+  printf "%-20s-+-%-34s-+-%-34s\n" "$(printf '%.0s-' {1..20})" "$(printf '%.0s-' {1..34})" "$(printf '%.0s-' {1..34})"
+  _print_table_row "TCP"         "${B_TCP_CC}"     "${A_TCP_CC}"
+  _print_table_row "Qdisc"       "${B_QDISC}"      "${A_QDISC}"
+  _print_table_row "IP forward"  "${B_FWD}"        "${A_FWD}"
+  _print_table_row "Conntrack"   "${B_CT_MAX}"     "${A_CT_MAX}"
+  _print_table_row "TW buckets"  "${B_TW}"         "${A_TW}"
+  _print_table_row "Swappiness"  "${B_SWAPPINESS}" "${A_SWAPPINESS}"
+  _print_table_row "Swap"        "${B_SWAP}"       "${A_SWAP}"
+  _print_table_row "Nofile"      "${B_NOFILE}"     "${A_NOFILE}"
+  _print_table_row "Journald"    "${B_JOURNAL}"    "${A_JOURNAL}"
+  _print_table_row "Logrotate"   "${B_LOGROT}"     "${A_LOGROT}"
+  _print_table_row "Unattended"  "${B_UNATT}"      "${A_UNATT}"
+}
+
+print_manifest_table() {
+  local man="$1"
+  [[ -f "$man" ]] || return 0
+
+  local copies moves
+  copies="$(awk -F'\t' '$1=="COPY"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
+  moves="$(awk -F'\t' '$1=="MOVE"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
+
+  echo
+  echo "Files snapshot"
+  echo "  copied to backup: $copies"
+  echo "  moved aside:      $moves"
+
+  if [[ "$moves" -gt 0 ]]; then
+    echo
+    echo "Moved aside (original -> stored in backup)"
+    printf "%-52s | %s\n" "Original path" "Backup path"
+    printf "%-52s-+-%s\n" "$(printf '%.0s-' {1..52})" "$(printf '%.0s-' {1..60})"
+    awk -F'\t' '$1=="MOVE"{printf "%-52s | %s\n",$2,$3}' "$man" | head -n 200
+    if [[ "$moves" -gt 200 ]]; then
+      echo "(showing first 200 moved files)"
+    fi
+  fi
+
+  if [[ "$copies" -gt 0 ]]; then
+    echo
+    echo "Backed up (original -> stored in backup)"
+    printf "%-52s | %s\n" "Original path" "Backup path"
+    printf "%-52s-+-%s\n" "$(printf '%.0s-' {1..52})" "$(printf '%.0s-' {1..60})"
+    awk -F'\t' '$1=="COPY"{printf "%-52s | %s\n",$2,$3}' "$man" | head -n 200
+    if [[ "$copies" -gt 200 ]]; then
+      echo "(showing first 200 copied files)"
+    fi
+  fi
+}
+
+###############################################################################
+# status
 ###############################################################################
 print_summary() {
   local mode="$1" profile="$2" backup="$3"
@@ -165,9 +293,6 @@ print_summary() {
   echo "SUMMARY status=OK host=$(host_short) mode=$mode profile=$profile bbr=$bbr qdisc=$qdisc ip_forward=$fwd twbuckets=$twb ct=${ctcnt}/${ctmax} nofile=$nof swap_mib=$swap_mib swappiness=$swpns journald=${jr_sys:-?}/${jr_run:-?} logrotate=${lr_freq}/rotate=${lr_rot} unattended=${ureb:-n/a} backup=${backup:-n/a}"
 }
 
-###############################################################################
-# status
-###############################################################################
 status_cmd() {
   print_summary "status" "-" "-"
 }
@@ -198,6 +323,9 @@ apply_cmd() {
   log "Step 1/9: create backup"
   mkbackup
   _APPLY_CREATED_BACKUP="1"
+
+  # snapshot BEFORE any changes
+  snapshot_before
 
   log "Step 2/9: discover resources"
   local mem_kb mem_mb cpu
@@ -545,6 +673,12 @@ EOM
 
   ok "apply finished"
   trap - ERR
+
+  # snapshot AFTER changes and print tables
+  snapshot_after
+  print_changes_table
+  print_manifest_table "$manifest"
+
   print_summary "apply" "$profile" "$backup_dir"
   echo "BACKUP_DIR=$backup_dir"
 }
@@ -560,6 +694,11 @@ rollback_cmd() {
     backup="$(latest_backup_dir)"
   fi
   [[ -n "$backup" && -d "$backup" ]] || die "Backup not found. Set BACKUP_DIR=/root/edge-tuning-backup-... or run apply first."
+
+  local man="${backup}/MANIFEST.tsv"
+
+  # snapshot BEFORE rollback
+  snapshot_before
 
   log "Rollback: using backup=$backup"
 
@@ -590,6 +729,12 @@ rollback_cmd() {
   systemctl restart systemd-journald >/dev/null 2>&1 || true
 
   ok "rollback finished"
+
+  # snapshot AFTER rollback and print tables
+  snapshot_after
+  print_changes_table
+  print_manifest_table "$man"
+
   print_summary "rollback" "-" "$backup"
 }
 
