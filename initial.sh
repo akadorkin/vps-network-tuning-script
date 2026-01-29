@@ -114,6 +114,34 @@ latest_backup_dir() {
 }
 
 ###############################################################################
+# Helpers
+###############################################################################
+to_int() {
+  # best-effort convert to integer, fallback 0
+  local s="${1:-}"
+  if [[ "$s" =~ ^[0-9]+$ ]]; then
+    echo "$s"
+  else
+    echo 0
+  fi
+}
+imax() {
+  local a b
+  a="$(to_int "${1:-0}")"
+  b="$(to_int "${2:-0}")"
+  [[ "$a" -ge "$b" ]] && echo "$a" || echo "$b"
+}
+clamp() {
+  local v lo hi
+  v="$(to_int "${1:-0}")"
+  lo="$(to_int "${2:-0}")"
+  hi="$(to_int "${3:-0}")"
+  [[ "$v" -lt "$lo" ]] && v="$lo"
+  [[ "$v" -gt "$hi" ]] && v="$hi"
+  echo "$v"
+}
+
+###############################################################################
 # Snapshots (before/after)
 ###############################################################################
 _journald_caps() {
@@ -192,7 +220,6 @@ snapshot_after() {
 ###############################################################################
 # Tiered selection (RAM + CPU), and disk-aware logging caps
 ###############################################################################
-# Tiers: 1/2/4/8/16/32/64+
 ceil_gib() { local mem_mb="$1"; echo $(( (mem_mb + 1023) / 1024 )); }
 
 ceil_to_tier() {
@@ -216,7 +243,7 @@ profile_from_tier() {
     8)  echo "xhigh" ;;
     16) echo "2xhigh" ;;
     32) echo "dedicated" ;;
-    *)  echo "dedicated+" ;; # 64+
+    *)  echo "dedicated+" ;;
   esac
 }
 
@@ -238,19 +265,15 @@ tier_max() {
   if [[ "$ra" -ge "$rb" ]]; then echo "$a"; else echo "$b"; fi
 }
 
-clamp() { local v="$1" lo="$2" hi="$3"; [[ "$v" -lt "$lo" ]] && v="$lo"; [[ "$v" -gt "$hi" ]] && v="$hi"; echo "$v"; }
-
-# Conntrack: soft by RAM + small CPU bonus (gentle, not explosive)
-# base: RAM_MiB * 32  (1 GiB -> 32768, 2 GiB -> 65536, 4 GiB -> 131072, ...)
-# bonus: CPU * 4096   (16 cores adds 65536)
+# Conntrack: softer but not too low for small VPS
+# ct_soft = RAM_MiB * 64 + CPU * 8192
 ct_soft_from_ram_cpu() {
   local mem_mb="$1" cpu="$2"
-  local ct=$(( mem_mb * 32 + cpu * 4096 ))
+  local ct=$(( mem_mb * 64 + cpu * 8192 ))
   [[ "$ct" -lt 32768 ]] && ct=32768
   echo "$ct"
 }
 
-# Disk size (MB) for /var/log (fallback to /)
 disk_size_mb_for_logs() {
   local mb=""
   mb="$(df -Pm /var/log 2>/dev/null | awk 'NR==2{print $2}' || true)"
@@ -259,29 +282,18 @@ disk_size_mb_for_logs() {
   echo "$mb"
 }
 
-# Pick journald caps + logrotate rotate based on disk size (keep logs minimal on small disks)
 pick_log_caps() {
   local disk_mb="$1"
-
-  # defaults
-  J_SYSTEM="100M"
-  J_RUNTIME="50M"
-  LR_ROTATE="7"
-
+  J_SYSTEM="100M"; J_RUNTIME="50M"; LR_ROTATE="7"
   if [[ "$disk_mb" -lt 15000 ]]; then
-    # < 15 GB: minimal
     J_SYSTEM="80M";  J_RUNTIME="40M";  LR_ROTATE="5"
   elif [[ "$disk_mb" -lt 30000 ]]; then
-    # 15-30 GB
     J_SYSTEM="120M"; J_RUNTIME="60M";  LR_ROTATE="7"
   elif [[ "$disk_mb" -lt 60000 ]]; then
-    # 30-60 GB
     J_SYSTEM="200M"; J_RUNTIME="100M"; LR_ROTATE="10"
   elif [[ "$disk_mb" -lt 120000 ]]; then
-    # 60-120 GB
     J_SYSTEM="300M"; J_RUNTIME="150M"; LR_ROTATE="14"
   else
-    # big disks
     J_SYSTEM="400M"; J_RUNTIME="200M"; LR_ROTATE="21"
   fi
 }
@@ -328,7 +340,7 @@ print_changes_table_diff() {
   _print_diff_row "Journald"   "$B_JOURNAL" "$A_JOURNAL" && printed=1 || true
   _print_diff_row "Logrotate"  "$B_LOGROT" "$A_LOGROT" && printed=1 || true
 
-  # Always show reboot-related rows (so you always see them)
+  # Always show reboot-related rows
   local b_ar b_rt a_ar a_rt
   b_ar="$(_unattended_state "$B_UNATT")"; b_rt="$(_unattended_time "$B_UNATT")"
   a_ar="$(_unattended_state "$A_UNATT")"; a_rt="$(_unattended_time "$A_UNATT")"
@@ -365,12 +377,7 @@ _APPLY_CREATED_BACKUP="0"
 on_apply_fail() {
   local code=$?
   err "Apply failed (exit code=$code)."
-  if [[ "$_APPLY_CREATED_BACKUP" == "1" && "${EDGE_AUTO_ROLLBACK:-0}" == "1" ]]; then
-    warn "Auto rollback from: $backup_dir"
-    BACKUP_DIR="$backup_dir" rollback_cmd || true
-  else
-    warn "Rollback: sudo BACKUP_DIR=$backup_dir $0 rollback"
-  fi
+  warn "Rollback: sudo BACKUP_DIR=$backup_dir $0 rollback"
   exit "$code"
 }
 
@@ -412,7 +419,7 @@ apply_cmd() {
 
   # Defaults by profile (network + limits)
   local somaxconn netdev_backlog syn_backlog rmem_max wmem_max rmem_def wmem_def tcp_rmem tcp_wmem
-  local swappiness nofile tw_buckets
+  local swappiness nofile_profile tw_profile
   local ct_min ct_cap
 
   case "$profile" in
@@ -423,8 +430,8 @@ apply_cmd() {
       tcp_rmem="4096 262144 ${rmem_max}"
       tcp_wmem="4096 262144 ${wmem_max}"
       swappiness=5
-      nofile=65536
-      tw_buckets=50000
+      nofile_profile=65536
+      tw_profile=50000
       ct_min=32768;   ct_cap=65536
       ;;
     mid)
@@ -434,8 +441,8 @@ apply_cmd() {
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
       swappiness=10
-      nofile=131072
-      tw_buckets=90000
+      nofile_profile=131072
+      tw_profile=90000
       ct_min=65536;   ct_cap=131072
       ;;
     high)
@@ -445,8 +452,8 @@ apply_cmd() {
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
       swappiness=10
-      nofile=262144
-      tw_buckets=150000
+      nofile_profile=262144
+      tw_profile=150000
       ct_min=131072;  ct_cap=262144
       ;;
     xhigh)
@@ -456,8 +463,8 @@ apply_cmd() {
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
       swappiness=10
-      nofile=524288
-      tw_buckets=250000
+      nofile_profile=524288
+      tw_profile=250000
       ct_min=262144;  ct_cap=524288
       ;;
     2xhigh)
@@ -467,8 +474,8 @@ apply_cmd() {
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
       swappiness=10
-      nofile=1048576
-      tw_buckets=350000
+      nofile_profile=1048576
+      tw_profile=350000
       ct_min=524288;  ct_cap=1048576
       ;;
     dedicated)
@@ -478,8 +485,8 @@ apply_cmd() {
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
       swappiness=10
-      nofile=2097152
-      tw_buckets=600000
+      nofile_profile=2097152
+      tw_profile=600000
       ct_min=1048576; ct_cap=2097152
       ;;
     dedicated+)
@@ -489,19 +496,30 @@ apply_cmd() {
       tcp_rmem="4096 87380 ${rmem_max}"
       tcp_wmem="4096 65536 ${wmem_max}"
       swappiness=10
-      nofile=4194304
-      tw_buckets=900000
+      nofile_profile=4194304
+      tw_profile=900000
       ct_min=2097152; ct_cap=4194304
       ;;
   esac
 
-  # Conntrack: soft by RAM+CPU, clamped per profile
-  local ct_soft ct_max
-  ct_soft="$(ct_soft_from_ram_cpu "$mem_mb" "$cpu")"
-  ct_max="$(clamp "$ct_soft" "$ct_min" "$ct_cap")"
-  local ct_buckets=$((ct_max/4)); [[ "$ct_buckets" -lt 4096 ]] && ct_buckets=4096
+  # Never decrease: use current as floor
+  local current_ct current_tw current_nofile
+  current_ct="$(to_int "$B_CT_MAX")"
+  current_tw="$(to_int "$B_TW")"
+  current_nofile="$(to_int "$B_NOFILE")"
 
-  # Swap sizing (kept simple; only if no swap partition)
+  local nofile_final tw_final
+  nofile_final="$(imax "$current_nofile" "$nofile_profile")"
+  tw_final="$(imax "$current_tw" "$tw_profile")"
+
+  # Conntrack: compute -> clamp -> never-decrease
+  local ct_soft ct_clamped ct_final
+  ct_soft="$(ct_soft_from_ram_cpu "$mem_mb" "$cpu")"
+  ct_clamped="$(clamp "$ct_soft" "$ct_min" "$ct_cap")"
+  ct_final="$(imax "$current_ct" "$ct_clamped")"
+  local ct_buckets=$((ct_final/4)); [[ "$ct_buckets" -lt 4096 ]] && ct_buckets=4096
+
+  # Swap sizing (only if no swap partition)
   backup_file /etc/fstab
   local swap_gb=2
   if   [[ "$mem_mb" -lt 2048  ]]; then swap_gb=1
@@ -605,7 +623,7 @@ vm.vfs_cache_pressure = 50
 EOM
 
   cat > /etc/sysctl.d/99-edge-conntrack.conf <<EOM
-net.netfilter.nf_conntrack_max = ${ct_max}
+net.netfilter.nf_conntrack_max = ${ct_final}
 net.netfilter.nf_conntrack_buckets = ${ct_buckets}
 net.netfilter.nf_conntrack_tcp_timeout_established = 900
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 15
@@ -615,7 +633,7 @@ EOM
 
   cat > /etc/sysctl.d/92-edge-safe.conf <<EOM
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_tw_buckets = ${tw_buckets}
+net.ipv4.tcp_max_tw_buckets = ${tw_final}
 net.ipv4.tcp_rfc1337 = 1
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 30
@@ -624,7 +642,7 @@ EOM
 
   sysctl --system >/dev/null 2>&1 || true
 
-  # NOFILE
+  # NOFILE (never decrease)
   backup_file /etc/systemd/system.conf || true
   mkdir -p /etc/systemd/system.conf.d
   shopt -s nullglob
@@ -636,7 +654,7 @@ EOM
 
   cat > /etc/systemd/system.conf.d/90-edge.conf <<EOM
 [Manager]
-DefaultLimitNOFILE=${nofile}
+DefaultLimitNOFILE=${nofile_final}
 EOM
 
   mkdir -p /etc/security/limits.d
@@ -648,15 +666,15 @@ EOM
   shopt -u nullglob
 
   cat > /etc/security/limits.d/90-edge.conf <<EOM
-* soft nofile ${nofile}
-* hard nofile ${nofile}
-root soft nofile ${nofile}
-root hard nofile ${nofile}
+* soft nofile ${nofile_final}
+* hard nofile ${nofile_final}
+root soft nofile ${nofile_final}
+root hard nofile ${nofile_final}
 EOM
 
   systemctl daemon-reexec >/dev/null 2>&1 || true
 
-  # journald (disk-aware)
+  # journald
   mkdir -p /etc/systemd/journald.conf.d
   shopt -s nullglob
   for f in /etc/systemd/journald.conf.d/*.conf; do
@@ -688,7 +706,7 @@ EOM
     systemctl enable --now irqbalance >/dev/null 2>&1 || true
   fi
 
-  # logrotate (disk-aware rotate count)
+  # logrotate
   backup_file /etc/logrotate.conf
   cat > /etc/logrotate.conf <<EOM
 daily
@@ -793,7 +811,6 @@ rollback_cmd() {
   snapshot_after
 
   ok "Rolled back. Backup used: $backup"
-  # compact rollback run info (no recalculation)
   echo
   echo "Run"
   printf "%-12s | %s\n" "Host"  "$(host_short)"
@@ -820,9 +837,6 @@ status_cmd() {
   printf "%-12s | %s\n" "RebootTime" "$(_unattended_time "$B_UNATT")"
 }
 
-###############################################################################
-# main
-###############################################################################
 case "${1:-}" in
   apply)    shift; apply_cmd "$@" ;;
   rollback) shift; rollback_cmd "$@" ;;
