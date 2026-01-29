@@ -23,7 +23,7 @@ err()  { local p="ERROR"; _is_tty && printf "%s%s[%s]%s %s\n" "${c_dim}" "$(ts) 
 die() { err "$*"; exit 1; }
 
 ###############################################################################
-# root / sudo handling (works for file-run; for piped-run require sudo bash -s)
+# root / sudo handling
 ###############################################################################
 need_root() {
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -45,6 +45,23 @@ need_root() {
 }
 
 host_short() { hostname -s 2>/dev/null || hostname; }
+
+###############################################################################
+# optional confirmation (OFF by default)
+###############################################################################
+confirm() {
+  # default: no prompt at all
+  [[ "${EDGE_CONFIRM:-0}" == "1" ]] || return 0
+
+  # if there is no stdin tty, don't block
+  [[ -t 0 ]] || return 0
+
+  echo
+  echo "This will modify sysctl, swap, limits, journald, unattended-upgrades, logrotate, tmpfiles."
+  echo "A backup + manifest will be created under /root/edge-tuning-backup-<timestamp>."
+  read -r -p "Continue? [y/N] " ans
+  [[ "$ans" == "y" || "$ans" == "Y" ]] || die "Cancelled."
+}
 
 ###############################################################################
 # backup helpers with manifest (restore exact original locations)
@@ -70,7 +87,13 @@ mkbackup() {
 backup_file() {
   local src="$1"
   [[ -f "$src" ]] || return 0
-  local rel="${src#/}" dst="${backup_dir}/files/${rel}"
+
+  local rel
+  rel="${src#/}"
+
+  local dst
+  dst="${backup_dir}/files/${rel}"
+
   mkdir -p "$(dirname "$dst")"
   cp -a "$src" "$dst"
   printf "COPY\t%s\t%s\n" "$src" "$dst" >> "$manifest"
@@ -79,7 +102,13 @@ backup_file() {
 move_aside() {
   local src="$1"
   [[ -f "$src" ]] || return 0
-  local rel="${src#/}" dst="${moved_dir}/${rel}"
+
+  local rel
+  rel="${src#/}"
+
+  local dst
+  dst="${moved_dir}/${rel}"
+
   mkdir -p "$(dirname "$dst")"
   mv -f "$src" "$dst"
   printf "MOVE\t%s\t%s\n" "$src" "$dst" >> "$manifest"
@@ -112,17 +141,8 @@ latest_backup_dir() {
 }
 
 ###############################################################################
-# misc
+# summary
 ###############################################################################
-confirm() {
-  [[ "${EDGE_ASSUME_YES:-0}" == "1" ]] && return 0
-  echo
-  echo "This will modify sysctl, swap, limits, journald, unattended-upgrades, logrotate, tmpfiles."
-  echo "A backup + manifest will be created under /root/edge-tuning-backup-<timestamp>."
-  read -r -p "Continue? [y/N] " ans
-  [[ "$ans" == "y" || "$ans" == "Y" ]]
-}
-
 print_summary() {
   local mode="$1" profile="$2" backup="$3"
 
@@ -171,7 +191,7 @@ on_apply_fail() {
 
 apply_cmd() {
   need_root "$@"
-  confirm || die "Cancelled."
+  confirm
 
   trap on_apply_fail ERR
 
