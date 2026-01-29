@@ -2,96 +2,77 @@
 set -Eeuo pipefail
 
 ###############################################################################
-# logging
+# Minimal logging (less noise)
 ###############################################################################
 LOG_TS="${EDGE_LOG_TS:-1}"
-
 ts() { [[ "$LOG_TS" == "1" ]] && date +"%Y-%m-%d %H:%M:%S" || true; }
+
 _is_tty() { [[ -t 1 ]]; }
+c_reset=$'\033[0m'; c_dim=$'\033[2m'; c_red=$'\033[31m'; c_yel=$'\033[33m'; c_grn=$'\033[32m'
 
-c_reset=$'\033[0m'
-c_dim=$'\033[2m'
-c_red=$'\033[31m'
-c_yel=$'\033[33m'
-c_grn=$'\033[32m'
-
-log()  { local p="INFO";  _is_tty && printf "%s%s[%s]%s %s\n" "${c_dim}" "$(ts) " "$p" "${c_reset}" "$*" || printf "[%s] %s\n" "$p" "$*"; }
-ok()   { local p="OK";    _is_tty && printf "%s%s[%s]%s %s\n" "${c_dim}" "$(ts) " "${c_grn}${p}${c_reset}" "${c_reset}" "$*" || printf "[%s] %s\n" "$p" "$*"; }
-warn() { local p="WARN";  _is_tty && printf "%s%s[%s]%s %s\n" "${c_dim}" "$(ts) " "${c_yel}${p}${c_reset}" "${c_reset}" "$*" || printf "[%s] %s\n" "$p" "$*"; }
-err()  { local p="ERROR"; _is_tty && printf "%s%s[%s]%s %s\n" "${c_dim}" "$(ts) " "${c_red}${p}${c_reset}" "${c_reset}" "$*" || printf "[%s] %s\n" "$p" "$*"; }
-
+_pfx() { _is_tty && printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}" || true; }
+log()  { _pfx; echo "$*"; }
+ok()   { _pfx; _is_tty && printf "%sOK%s " "$c_grn" "$c_reset" || printf "OK "; echo "$*"; }
+warn() { _pfx; _is_tty && printf "%sWARN%s " "$c_yel" "$c_reset" || printf "WARN "; echo "$*"; }
+err()  { _pfx; _is_tty && printf "%sERROR%s " "$c_red" "$c_reset" || printf "ERROR "; echo "$*"; }
 die() { err "$*"; exit 1; }
 
+host_short() { hostname -s 2>/dev/null || hostname; }
+
 ###############################################################################
-# root / sudo handling
+# Root / sudo
 ###############################################################################
 need_root() {
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
     return 0
   fi
 
-  # If script is a real file, we can re-exec with sudo.
   local self="${BASH_SOURCE[0]:-}"
   if [[ -n "$self" && -f "$self" && -r "$self" ]]; then
     if command -v sudo >/dev/null 2>&1; then
-      warn "Not running as root. Re-executing via sudo..."
+      warn "Not root -> re-exec via sudo"
       exec sudo -E bash "$self" "$@"
     fi
-    die "Not root and sudo not found. Run as root."
+    die "Not root and sudo not found."
   fi
 
-  # Probably running from stdin (curl | bash). Can't re-exec reliably.
   die "Not root. Use: curl ... | sudo bash -s -- <cmd>"
 }
 
-host_short() { hostname -s 2>/dev/null || hostname; }
-
 ###############################################################################
-# confirmation (OFF by default)
+# Confirmation (OFF by default)
 ###############################################################################
 confirm() {
-  # never prompt by default; enable only if EDGE_CONFIRM=1 and stdin is a tty
   [[ "${EDGE_CONFIRM:-0}" == "1" ]] || return 0
   [[ -t 0 ]] || return 0
-
   echo
-  echo "This will modify sysctl, swap, limits, journald, unattended-upgrades, logrotate, tmpfiles."
-  echo "A backup + manifest will be created under /root/edge-tuning-backup-<timestamp>."
+  echo "This will tune sysctl, swap, limits, journald, unattended-upgrades, logrotate, tmpfiles."
   read -r -p "Continue? [y/N] " ans
   [[ "$ans" == "y" || "$ans" == "Y" ]] || die "Cancelled."
 }
 
 ###############################################################################
-# backup helpers with manifest (restore exact original locations)
+# Backup + manifest
 ###############################################################################
 backup_dir=""
 moved_dir=""
 manifest=""
 
 mkbackup() {
-  local tsd
-  tsd="${BACKUP_TS:-${EDGE_BACKUP_TS:-}}"
-  if [[ -z "$tsd" ]]; then
-    tsd="$(date +%Y%m%d-%H%M%S)"
-  fi
+  local tsd="${BACKUP_TS:-${EDGE_BACKUP_TS:-}}"
+  [[ -n "$tsd" ]] || tsd="$(date +%Y%m%d-%H%M%S)"
   backup_dir="/root/edge-tuning-backup-${tsd}"
   moved_dir="${backup_dir}/moved"
   manifest="${backup_dir}/MANIFEST.tsv"
   mkdir -p "$backup_dir" "$moved_dir"
   : > "$manifest"
-  ok "Backup dir: $backup_dir"
 }
 
 backup_file() {
   local src="$1"
   [[ -f "$src" ]] || return 0
-
-  local rel
-  rel="${src#/}"
-
-  local dst
-  dst="${backup_dir}/files/${rel}"
-
+  local rel="${src#/}"
+  local dst="${backup_dir}/files/${rel}"
   mkdir -p "$(dirname "$dst")"
   cp -a "$src" "$dst"
   printf "COPY\t%s\t%s\n" "$src" "$dst" >> "$manifest"
@@ -100,13 +81,8 @@ backup_file() {
 move_aside() {
   local src="$1"
   [[ -f "$src" ]] || return 0
-
-  local rel
-  rel="${src#/}"
-
-  local dst
-  dst="${moved_dir}/${rel}"
-
+  local rel="${src#/}"
+  local dst="${moved_dir}/${rel}"
   mkdir -p "$(dirname "$dst")"
   mv -f "$src" "$dst"
   printf "MOVE\t%s\t%s\n" "$src" "$dst" >> "$manifest"
@@ -139,7 +115,7 @@ latest_backup_dir() {
 }
 
 ###############################################################################
-# state snapshots (for nice table output)
+# Snapshots (before/after)
 ###############################################################################
 _journald_caps() {
   local f="/etc/systemd/journald.conf.d/90-edge.conf"
@@ -164,18 +140,14 @@ _logrotate_mode() {
 _unattended_reboot_setting() {
   # returns: "<true|false|-> / <HH:MM|->"
   local reboot time
-
   reboot="$(grep -Rhs 'Unattended-Upgrade::Automatic-Reboot' /etc/apt/apt.conf.d/*.conf 2>/dev/null \
     | sed -nE 's/.*Automatic-Reboot\s+"([^"]+)".*/\1/p' | tail -n1 || true)"
   time="$(grep -Rhs 'Unattended-Upgrade::Automatic-Reboot-Time' /etc/apt/apt.conf.d/*.conf 2>/dev/null \
     | sed -nE 's/.*Automatic-Reboot-Time\s+"([^"]+)".*/\1/p' | tail -n1 || true)"
-
   [[ -z "${reboot:-}" ]] && reboot="-"
   [[ -z "${time:-}" ]] && time="-"
-
   echo "${reboot} / ${time}"
 }
-
 _unattended_state() { echo "${1%% / *}"; }
 _unattended_time()  { echo "${1##* / }"; }
 
@@ -220,35 +192,55 @@ snapshot_after() {
 }
 
 ###############################################################################
-# pretty output: tables
+# Output: compact tables
 ###############################################################################
-_print_table_row() {
-  # args: label before after
-  printf "%-20s | %-34s | %-34s\n" "$1" "$2" "$3"
-}
-
-print_changes_table() {
+print_run_table() {
+  local mode="$1" profile="$2" backup="$3"
   echo
-  echo "Changes summary (before -> after)"
-  printf "%-20s-+-%-34s-+-%-34s\n" "$(printf '%.0s-' {1..20})" "$(printf '%.0s-' {1..34})" "$(printf '%.0s-' {1..34})"
-
-  _print_table_row "TCP"         "${B_TCP_CC}"     "${A_TCP_CC}"
-  _print_table_row "Qdisc"       "${B_QDISC}"      "${A_QDISC}"
-  _print_table_row "IP forward"  "${B_FWD}"        "${A_FWD}"
-  _print_table_row "Conntrack"   "${B_CT_MAX}"     "${A_CT_MAX}"
-  _print_table_row "TW buckets"  "${B_TW}"         "${A_TW}"
-  _print_table_row "Swappiness"  "${B_SWAPPINESS}" "${A_SWAPPINESS}"
-  _print_table_row "Swap"        "${B_SWAP}"       "${A_SWAP}"
-  _print_table_row "Nofile"      "${B_NOFILE}"     "${A_NOFILE}"
-  _print_table_row "Journald"    "${B_JOURNAL}"    "${A_JOURNAL}"
-  _print_table_row "Logrotate"   "${B_LOGROT}"     "${A_LOGROT}"
-
-  # cleaner unattended info:
-  _print_table_row "Auto reboot" "$(_unattended_state "$B_UNATT")" "$(_unattended_state "$A_UNATT")"
-  _print_table_row "Reboot time" "$(_unattended_time  "$B_UNATT")" "$(_unattended_time  "$A_UNATT")"
+  echo "Run"
+  printf "%-10s | %s\n" "Host"   "$(host_short)"
+  printf "%-10s | %s\n" "Mode"   "$mode"
+  printf "%-10s | %s\n" "Profile" "${profile:-"-"}"
+  printf "%-10s | %s\n" "Backup" "${backup:-"-"}"
 }
 
-print_manifest_table() {
+_print_diff_row() {
+  # label before after; print only if changed
+  local label="$1" b="$2" a="$3"
+  [[ "$b" == "$a" ]] && return 0
+  printf "%-12s | %-24s | %-24s\n" "$label" "$b" "$a"
+  return 0
+}
+
+print_changes_table_diff() {
+  echo
+  echo "Changed (before -> after)"
+  printf "%-12s-+-%-24s-+-%-24s\n" "$(printf '%.0s-' {1..12})" "$(printf '%.0s-' {1..24})" "$(printf '%.0s-' {1..24})"
+
+  local printed=0
+  _print_diff_row "TCP"        "$B_TCP_CC" "$A_TCP_CC" && [[ "$B_TCP_CC" != "$A_TCP_CC" ]] && printed=1 || true
+  _print_diff_row "Qdisc"      "$B_QDISC" "$A_QDISC" && [[ "$B_QDISC" != "$A_QDISC" ]] && printed=1 || true
+  _print_diff_row "Forward"    "$B_FWD" "$A_FWD" && [[ "$B_FWD" != "$A_FWD" ]] && printed=1 || true
+  _print_diff_row "Conntrack"  "$B_CT_MAX" "$A_CT_MAX" && [[ "$B_CT_MAX" != "$A_CT_MAX" ]] && printed=1 || true
+  _print_diff_row "TW buckets" "$B_TW" "$A_TW" && [[ "$B_TW" != "$A_TW" ]] && printed=1 || true
+  _print_diff_row "Swappiness" "$B_SWAPPINESS" "$A_SWAPPINESS" && [[ "$B_SWAPPINESS" != "$A_SWAPPINESS" ]] && printed=1 || true
+  _print_diff_row "Swap"       "$B_SWAP" "$A_SWAP" && [[ "$B_SWAP" != "$A_SWAP" ]] && printed=1 || true
+  _print_diff_row "Nofile"     "$B_NOFILE" "$A_NOFILE" && [[ "$B_NOFILE" != "$A_NOFILE" ]] && printed=1 || true
+  _print_diff_row "Journald"   "$B_JOURNAL" "$A_JOURNAL" && [[ "$B_JOURNAL" != "$A_JOURNAL" ]] && printed=1 || true
+  _print_diff_row "Logrotate"  "$B_LOGROT" "$A_LOGROT" && [[ "$B_LOGROT" != "$A_LOGROT" ]] && printed=1 || true
+
+  local b_ar b_rt a_ar a_rt
+  b_ar="$(_unattended_state "$B_UNATT")"; b_rt="$(_unattended_time "$B_UNATT")"
+  a_ar="$(_unattended_state "$A_UNATT")"; a_rt="$(_unattended_time "$A_UNATT")"
+  _print_diff_row "Auto reboot" "$b_ar" "$a_ar" && [[ "$b_ar" != "$a_ar" ]] && printed=1 || true
+  _print_diff_row "Reboot time" "$b_rt" "$a_rt" && [[ "$b_rt" != "$a_rt" ]] && printed=1 || true
+
+  if [[ "$printed" -eq 0 ]]; then
+    echo "(no changes — already tuned)"
+  fi
+}
+
+print_manifest_compact() {
   local man="$1"
   [[ -f "$man" ]] || return 0
 
@@ -257,75 +249,30 @@ print_manifest_table() {
   moves="$(awk -F'\t' '$1=="MOVE"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
 
   echo
-  echo "Files snapshot"
-  echo "  copied to backup: $copies"
-  echo "  moved aside:      $moves"
+  echo "Files"
+  echo "  backed up:   $copies"
+  echo "  moved aside: $moves"
 
   if [[ "$moves" -gt 0 ]]; then
     echo
-    echo "Moved aside (original -> stored in backup)"
-    printf "%-52s | %s\n" "Original path" "Backup path"
-    printf "%-52s-+-%s\n" "$(printf '%.0s-' {1..52})" "$(printf '%.0s-' {1..60})"
-    awk -F'\t' '$1=="MOVE"{printf "%-52s | %s\n",$2,$3}' "$man" | head -n 200
-    if [[ "$moves" -gt 200 ]]; then
-      echo "(showing first 200 moved files)"
-    fi
-  fi
-
-  if [[ "$copies" -gt 0 ]]; then
-    echo
-    echo "Backed up (original -> stored in backup)"
-    printf "%-52s | %s\n" "Original path" "Backup path"
-    printf "%-52s-+-%s\n" "$(printf '%.0s-' {1..52})" "$(printf '%.0s-' {1..60})"
-    awk -F'\t' '$1=="COPY"{printf "%-52s | %s\n",$2,$3}' "$man" | head -n 200
-    if [[ "$copies" -gt 200 ]]; then
-      echo "(showing first 200 copied files)"
-    fi
+    echo "Moved aside:"
+    awk -F'\t' '$1=="MOVE"{print "  - " $2}' "$man" | head -n 50
+    [[ "$moves" -gt 50 ]] && echo "  (showing first 50)"
   fi
 }
 
 ###############################################################################
-# status
-###############################################################################
-print_summary() {
-  local mode="$1" profile="$2" backup="$3"
-
-  local bbr qdisc fwd ctmax ctcnt nof swap_mib swpns twb jr_sys jr_run lr_freq lr_rot ureb
-  bbr="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo '?')"
-  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo '?')"
-  fwd="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo '?')"
-  ctmax="$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo 'n/a')"
-  ctcnt="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 'n/a')"
-  nof="$(systemctl show --property DefaultLimitNOFILE 2>/dev/null | cut -d= -f2 || echo '?')"
-  swap_mib="$(awk '/SwapTotal:/ {print int(($2+1023)/1024)}' /proc/meminfo 2>/dev/null || echo '?')"
-  swpns="$(sysctl -n vm.swappiness 2>/dev/null || echo '?')"
-  twb="$(sysctl -n net.ipv4.tcp_max_tw_buckets 2>/dev/null || echo '?')"
-  jr_sys="$(awk -F= '/^\s*SystemMaxUse=/{print $2}' /etc/systemd/journald.conf.d/90-edge.conf 2>/dev/null | tr -d ' ' || true)"
-  jr_run="$(awk -F= '/^\s*RuntimeMaxUse=/{print $2}' /etc/systemd/journald.conf.d/90-edge.conf 2>/dev/null | tr -d ' ' || true)"
-  lr_freq="$(awk 'tolower($1)=="daily"||tolower($1)=="weekly"||tolower($1)=="monthly"{print $1; exit}' /etc/logrotate.conf 2>/dev/null || echo '?')"
-  lr_rot="$(awk 'tolower($1)=="rotate"{print $2; exit}' /etc/logrotate.conf 2>/dev/null || echo '?')"
-  ureb="$(_unattended_reboot_setting)"
-
-  echo "SUMMARY status=OK host=$(host_short) mode=$mode profile=$profile bbr=$bbr qdisc=$qdisc ip_forward=$fwd twbuckets=$twb ct=${ctcnt}/${ctmax} nofile=$nof swap_mib=$swap_mib swappiness=$swpns journald=${jr_sys:-?}/${jr_run:-?} logrotate=${lr_freq}/rotate=${lr_rot} unattended=${ureb} backup=${backup:-n/a}"
-}
-
-status_cmd() {
-  print_summary "status" "-" "-"
-}
-
-###############################################################################
-# apply
+# apply / rollback
 ###############################################################################
 _APPLY_CREATED_BACKUP="0"
-
 on_apply_fail() {
   local code=$?
   err "Apply failed (exit code=$code)."
   if [[ "$_APPLY_CREATED_BACKUP" == "1" && "${EDGE_AUTO_ROLLBACK:-0}" == "1" ]]; then
-    warn "EDGE_AUTO_ROLLBACK=1 -> attempting rollback from: $backup_dir"
+    warn "Auto rollback from: $backup_dir"
     BACKUP_DIR="$backup_dir" rollback_cmd || true
   else
-    warn "Rollback is available via: sudo BACKUP_DIR=$backup_dir $0 rollback (or use latest backup)."
+    warn "Rollback: sudo BACKUP_DIR=$backup_dir $0 rollback"
   fi
   exit "$code"
 }
@@ -333,24 +280,21 @@ on_apply_fail() {
 apply_cmd() {
   need_root "$@"
   confirm
-
   trap on_apply_fail ERR
 
-  log "Step 1/9: create backup"
   mkbackup
   _APPLY_CREATED_BACKUP="1"
 
-  # snapshot BEFORE any changes
+  # BEFORE snapshot
   snapshot_before
 
-  log "Step 2/9: discover resources"
+  # Discover resources
   local mem_kb mem_mb cpu
   mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
   mem_mb="$((mem_kb / 1024))"
   cpu="$(nproc)"
-  ok "Detected: cpu=$cpu mem_mb=$mem_mb"
 
-  log "Step 3/9: choose profile"
+  # Choose profile
   local profile="xhigh"
   if [[ "$cpu" -le 1 || "$mem_mb" -lt 2048 ]]; then
     profile="low"
@@ -361,10 +305,9 @@ apply_cmd() {
   fi
   if [[ "${FORCE_PROFILE:-}" =~ ^(low|mid|high|xhigh)$ ]]; then
     profile="${FORCE_PROFILE}"
-    warn "FORCE_PROFILE set -> profile=$profile"
   fi
-  ok "Profile: $profile"
 
+  # Profile defaults
   local somaxconn netdev_backlog syn_backlog rmem_max wmem_max rmem_def wmem_def tcp_rmem tcp_wmem
   local ct_max swappiness nofile tw_buckets j_system j_runtime logrotate_rotate
 
@@ -425,9 +368,8 @@ apply_cmd() {
 
   local ct_buckets=$((ct_max/4)); [[ "$ct_buckets" -lt 4096 ]] && ct_buckets=4096
 
-  log "Step 4/9: swap sizing (/swapfile if no swap partition)"
+  # Swap sizing
   backup_file /etc/fstab
-
   local swap_gb=2
   if   [[ "$mem_mb" -lt 2048  ]]; then swap_gb=1
   elif [[ "$mem_mb" -lt 4096  ]]; then swap_gb=2
@@ -443,9 +385,7 @@ apply_cmd() {
     has_swap_partition="1"
   fi
 
-  if [[ "$has_swap_partition" == "1" ]]; then
-    ok "Swap partition detected -> leaving swap as-is."
-  else
+  if [[ "$has_swap_partition" == "0" ]]; then
     local active_swapfile="0"
     if /sbin/swapon --show=NAME 2>/dev/null | grep -qx '/swapfile'; then
       active_swapfile="1"
@@ -456,13 +396,12 @@ apply_cmd() {
       need_swapfile="1"
     elif [[ "$active_swapfile" == "1" ]]; then
       local diff=$(( swap_total_mb > swap_target_mb ? swap_total_mb - swap_target_mb : swap_target_mb - swap_total_mb ))
-      if [[ "$diff" -ge 256 ]]; then need_swapfile="1"; fi
+      [[ "$diff" -ge 256 ]] && need_swapfile="1"
     elif [[ -f /swapfile ]]; then
       need_swapfile="1"
     fi
 
     if [[ "$need_swapfile" == "1" ]]; then
-      log "Configuring /swapfile size=${swap_gb}G"
       /sbin/swapoff /swapfile 2>/dev/null || true
       rm -f /swapfile
       if command -v fallocate >/dev/null 2>&1; then
@@ -476,15 +415,11 @@ apply_cmd() {
       if ! grep -qE '^\s*/swapfile\s+none\s+swap\s' /etc/fstab; then
         echo '/swapfile none swap sw 0 0' >> /etc/fstab
       fi
-      ok "/swapfile enabled"
-    else
-      ok "Swap looks OK (swap_total_mb=${swap_total_mb} target_mb=${swap_target_mb})"
     fi
   fi
 
-  log "Step 5/9: sysctl tuning (BBR+fq, forwarding, safe tcp, conntrack, vm)"
+  # Sysctl
   backup_file /etc/sysctl.conf
-
   shopt -s nullglob
   for f in /etc/sysctl.d/*.conf; do
     [[ -f "$f" ]] || continue
@@ -492,7 +427,6 @@ apply_cmd() {
       /etc/sysctl.d/90-edge-network.conf|/etc/sysctl.d/92-edge-safe.conf|/etc/sysctl.d/95-edge-forward.conf|/etc/sysctl.d/96-edge-vm.conf|/etc/sysctl.d/99-edge-conntrack.conf) continue ;;
     esac
     if grep -Eq 'nf_conntrack_|tcp_congestion_control|default_qdisc|ip_forward|somaxconn|netdev_max_backlog|tcp_rmem|tcp_wmem|rmem_max|wmem_max|vm\.swappiness|vfs_cache_pressure|tcp_syncookies|tcp_max_tw_buckets|tcp_keepalive|tcp_mtu_probing|tcp_fin_timeout|tcp_tw_reuse|tcp_slow_start_after_idle|tcp_rfc1337' "$f"; then
-      warn "Moving aside conflicting sysctl fragment: $f"
       move_aside "$f"
     fi
   done
@@ -555,19 +489,15 @@ net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 5
 EOM
 
-  sysctl --system >/dev/null
-  ok "sysctl applied"
+  sysctl --system >/dev/null 2>&1 || true
 
-  log "Step 6/9: NOFILE (systemd + limits.d)"
-  backup_file /etc/systemd/system.conf
+  # NOFILE
+  backup_file /etc/systemd/system.conf || true
   mkdir -p /etc/systemd/system.conf.d
   shopt -s nullglob
   for f in /etc/systemd/system.conf.d/*.conf; do
     [[ "$f" == "/etc/systemd/system.conf.d/90-edge.conf" ]] && continue
-    if grep -qE '^\s*DefaultLimitNOFILE\s*=' "$f"; then
-      warn "Moving aside DefaultLimitNOFILE override: $f"
-      move_aside "$f"
-    fi
+    grep -qE '^\s*DefaultLimitNOFILE\s*=' "$f" && move_aside "$f"
   done
   shopt -u nullglob
 
@@ -580,10 +510,7 @@ EOM
   shopt -s nullglob
   for f in /etc/security/limits.d/*.conf; do
     [[ "$f" == "/etc/security/limits.d/90-edge.conf" ]] && continue
-    if grep -qE '^\s*[*a-zA-Z0-9._-]+\s+(soft|hard)\s+nofile\s+' "$f"; then
-      warn "Moving aside nofile limits: $f"
-      move_aside "$f"
-    fi
+    grep -qE '^\s*[*a-zA-Z0-9._-]+\s+(soft|hard)\s+nofile\s+' "$f" && move_aside "$f"
   done
   shopt -u nullglob
 
@@ -595,14 +522,12 @@ root hard nofile ${nofile}
 EOM
 
   systemctl daemon-reexec >/dev/null 2>&1 || true
-  ok "nofile configured (may require new session to fully apply)"
 
-  log "Step 7/9: journald limits"
+  # journald
   mkdir -p /etc/systemd/journald.conf.d
   shopt -s nullglob
   for f in /etc/systemd/journald.conf.d/*.conf; do
     [[ "$f" == "/etc/systemd/journald.conf.d/90-edge.conf" ]] && continue
-    warn "Moving aside journald override: $f"
     move_aside "$f"
   done
   shopt -u nullglob
@@ -616,22 +541,21 @@ RateLimitIntervalSec=30s
 RateLimitBurst=1000
 EOM
   systemctl restart systemd-journald >/dev/null 2>&1 || true
-  ok "journald configured"
 
-  log "Step 8/9: unattended-upgrades (disable auto reboot)"
+  # unattended upgrades
   mkdir -p /etc/apt/apt.conf.d
   backup_file /etc/apt/apt.conf.d/99-edge-unattended.conf
   cat > /etc/apt/apt.conf.d/99-edge-unattended.conf <<'EOM'
 Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::Automatic-Reboot-Time "04:00";
 EOM
-  ok "unattended-upgrades configured"
 
-  log "Step 9/9: irqbalance, logrotate, tmpfiles"
+  # irqbalance (best effort)
   if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^irqbalance\.service'; then
     systemctl enable --now irqbalance >/dev/null 2>&1 || true
   fi
 
+  # logrotate
   backup_file /etc/logrotate.conf
   cat > /etc/logrotate.conf <<EOM
 daily
@@ -679,6 +603,7 @@ EOM
 }
 EOM
 
+  # tmpfiles
   mkdir -p /etc/tmpfiles.d
   backup_file /etc/tmpfiles.d/edge-tmp.conf
   cat > /etc/tmpfiles.d/edge-tmp.conf <<'EOM'
@@ -687,36 +612,28 @@ D /var/tmp        1777 root root 14d
 EOM
   systemd-tmpfiles --create >/dev/null 2>&1 || true
 
-  ok "apply finished"
   trap - ERR
 
-  # snapshot AFTER changes and print tables
+  # AFTER snapshot + compact output
   snapshot_after
-  print_changes_table
-  print_manifest_table "$manifest"
 
-  print_summary "apply" "$profile" "$backup_dir"
+  ok "Applied. Backup: $backup_dir"
+  print_run_table "apply" "$profile" "$backup_dir"
+  print_changes_table_diff
+  print_manifest_compact "$manifest"
   echo "BACKUP_DIR=$backup_dir"
 }
 
-###############################################################################
-# rollback
-###############################################################################
 rollback_cmd() {
   need_root "$@"
 
   local backup="${BACKUP_DIR:-}"
-  if [[ -z "$backup" ]]; then
-    backup="$(latest_backup_dir)"
-  fi
+  [[ -n "$backup" ]] || backup="$(latest_backup_dir)"
   [[ -n "$backup" && -d "$backup" ]] || die "Backup not found. Set BACKUP_DIR=/root/edge-tuning-backup-... or run apply first."
 
   local man="${backup}/MANIFEST.tsv"
 
-  # snapshot BEFORE rollback
   snapshot_before
-
-  log "Rollback: using backup=$backup"
 
   rm -f /etc/sysctl.d/90-edge-network.conf \
         /etc/sysctl.d/92-edge-safe.conf \
@@ -731,7 +648,6 @@ rollback_cmd() {
         /etc/logrotate.d/edge-all-text-logs \
         /etc/tmpfiles.d/edge-tmp.conf 2>/dev/null || true
 
-  log "Restoring from manifest"
   restore_manifest "$backup"
 
   if /sbin/swapon --show=NAME 2>/dev/null | grep -qx '/swapfile'; then
@@ -744,14 +660,30 @@ rollback_cmd() {
   systemctl daemon-reexec >/dev/null 2>&1 || true
   systemctl restart systemd-journald >/dev/null 2>&1 || true
 
-  ok "rollback finished"
-
-  # snapshot AFTER rollback and print tables
   snapshot_after
-  print_changes_table
-  print_manifest_table "$man"
 
-  print_summary "rollback" "-" "$backup"
+  ok "Rolled back. Backup used: $backup"
+  print_run_table "rollback" "-" "$backup"
+  print_changes_table_diff
+  print_manifest_compact "$man"
+}
+
+status_cmd() {
+  snapshot_before
+  # just show current (no diff)
+  echo
+  echo "Current"
+  printf "%-12s | %s\n" "Host"      "$(host_short)"
+  printf "%-12s | %s\n" "TCP"       "$B_TCP_CC"
+  printf "%-12s | %s\n" "Qdisc"     "$B_QDISC"
+  printf "%-12s | %s\n" "Forward"   "$B_FWD"
+  printf "%-12s | %s\n" "Conntrack" "$B_CT_MAX"
+  printf "%-12s | %s\n" "Swap"      "$B_SWAP"
+  printf "%-12s | %s\n" "Nofile"    "$B_NOFILE"
+  printf "%-12s | %s\n" "Journald"  "$B_JOURNAL"
+  printf "%-12s | %s\n" "Logrotate" "$B_LOGROT"
+  printf "%-12s | %s\n" "AutoReboot" "$(_unattended_state "$B_UNATT")"
+  printf "%-12s | %s\n" "RebootTime" "$(_unattended_time "$B_UNATT")"
 }
 
 ###############################################################################
