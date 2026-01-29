@@ -162,10 +162,22 @@ _logrotate_mode() {
 }
 
 _unattended_reboot_setting() {
-  local s
-  s="$(grep -R --no-messages -h 'Unattended-Upgrade::Automatic-Reboot' /etc/apt/apt.conf.d/*.conf 2>/dev/null | tr -d ' ' | tr '\n' '|' | sed 's/|$//' || true)"
-  echo "${s:--}"
+  # returns: "<true|false|-> / <HH:MM|->"
+  local reboot time
+
+  reboot="$(grep -Rhs 'Unattended-Upgrade::Automatic-Reboot' /etc/apt/apt.conf.d/*.conf 2>/dev/null \
+    | sed -nE 's/.*Automatic-Reboot\s+"([^"]+)".*/\1/p' | tail -n1 || true)"
+  time="$(grep -Rhs 'Unattended-Upgrade::Automatic-Reboot-Time' /etc/apt/apt.conf.d/*.conf 2>/dev/null \
+    | sed -nE 's/.*Automatic-Reboot-Time\s+"([^"]+)".*/\1/p' | tail -n1 || true)"
+
+  [[ -z "${reboot:-}" ]] && reboot="-"
+  [[ -z "${time:-}" ]] && time="-"
+
+  echo "${reboot} / ${time}"
 }
+
+_unattended_state() { echo "${1%% / *}"; }
+_unattended_time()  { echo "${1##* / }"; }
 
 _swap_state() {
   local s
@@ -219,6 +231,7 @@ print_changes_table() {
   echo
   echo "Changes summary (before -> after)"
   printf "%-20s-+-%-34s-+-%-34s\n" "$(printf '%.0s-' {1..20})" "$(printf '%.0s-' {1..34})" "$(printf '%.0s-' {1..34})"
+
   _print_table_row "TCP"         "${B_TCP_CC}"     "${A_TCP_CC}"
   _print_table_row "Qdisc"       "${B_QDISC}"      "${A_QDISC}"
   _print_table_row "IP forward"  "${B_FWD}"        "${A_FWD}"
@@ -229,7 +242,10 @@ print_changes_table() {
   _print_table_row "Nofile"      "${B_NOFILE}"     "${A_NOFILE}"
   _print_table_row "Journald"    "${B_JOURNAL}"    "${A_JOURNAL}"
   _print_table_row "Logrotate"   "${B_LOGROT}"     "${A_LOGROT}"
-  _print_table_row "Unattended"  "${B_UNATT}"      "${A_UNATT}"
+
+  # cleaner unattended info:
+  _print_table_row "Auto reboot" "$(_unattended_state "$B_UNATT")" "$(_unattended_state "$A_UNATT")"
+  _print_table_row "Reboot time" "$(_unattended_time  "$B_UNATT")" "$(_unattended_time  "$A_UNATT")"
 }
 
 print_manifest_table() {
@@ -288,9 +304,9 @@ print_summary() {
   jr_run="$(awk -F= '/^\s*RuntimeMaxUse=/{print $2}' /etc/systemd/journald.conf.d/90-edge.conf 2>/dev/null | tr -d ' ' || true)"
   lr_freq="$(awk 'tolower($1)=="daily"||tolower($1)=="weekly"||tolower($1)=="monthly"{print $1; exit}' /etc/logrotate.conf 2>/dev/null || echo '?')"
   lr_rot="$(awk 'tolower($1)=="rotate"{print $2; exit}' /etc/logrotate.conf 2>/dev/null || echo '?')"
-  ureb="$(grep -R --no-messages -h 'Unattended-Upgrade::Automatic-Reboot' /etc/apt/apt.conf.d/*.conf 2>/dev/null | tr -d ' ' | tr '\n' '|' | sed 's/|$//' || true)"
+  ureb="$(_unattended_reboot_setting)"
 
-  echo "SUMMARY status=OK host=$(host_short) mode=$mode profile=$profile bbr=$bbr qdisc=$qdisc ip_forward=$fwd twbuckets=$twb ct=${ctcnt}/${ctmax} nofile=$nof swap_mib=$swap_mib swappiness=$swpns journald=${jr_sys:-?}/${jr_run:-?} logrotate=${lr_freq}/rotate=${lr_rot} unattended=${ureb:-n/a} backup=${backup:-n/a}"
+  echo "SUMMARY status=OK host=$(host_short) mode=$mode profile=$profile bbr=$bbr qdisc=$qdisc ip_forward=$fwd twbuckets=$twb ct=${ctcnt}/${ctmax} nofile=$nof swap_mib=$swap_mib swappiness=$swpns journald=${jr_sys:-?}/${jr_run:-?} logrotate=${lr_freq}/rotate=${lr_rot} unattended=${ureb} backup=${backup:-n/a}"
 }
 
 status_cmd() {
