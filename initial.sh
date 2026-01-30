@@ -2,12 +2,12 @@
 set -Eeuo pipefail
 
 ###############################################################################
-# Minimal logging + colors
+# Logging + colors
 ###############################################################################
 LOG_TS="${EDGE_LOG_TS:-1}"
 ts() { [[ "$LOG_TS" == "1" ]] && date +"%Y-%m-%d %H:%M:%S" || true; }
-
 _is_tty() { [[ -t 1 ]]; }
+
 c_reset=$'\033[0m'
 c_dim=$'\033[2m'
 c_bold=$'\033[1m'
@@ -15,18 +15,19 @@ c_red=$'\033[31m'
 c_yel=$'\033[33m'
 c_grn=$'\033[32m'
 c_cyan=$'\033[36m'
-c_mag=$'\033[35m'
+
+color() { # color <ansi> <text>
+  local code="$1"; shift
+  if _is_tty; then printf "%s%s%s" "$code" "$*" "$c_reset"; else printf "%s" "$*"; fi
+}
 
 _pfx() { _is_tty && printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}" || true; }
-
-ok()   { _pfx; _is_tty && printf "%sOK%s " "$c_grn" "$c_reset" || printf "OK "; echo "$*"; }
-warn() { _pfx; _is_tty && printf "%sWARN%s " "$c_yel" "$c_reset" || printf "WARN "; echo "$*"; }
-err()  { _pfx; _is_tty && printf "%sERROR%s " "$c_red" "$c_reset" || printf "ERROR "; echo "$*"; }
+ok()   { _pfx; color "$c_grn" "OK";   printf " %s\n" "$*"; }
+warn() { _pfx; color "$c_yel" "WARN"; printf " %s\n" "$*"; }
+err()  { _pfx; color "$c_red" "ERROR";printf " %s\n" "$*"; }
 die()  { err "$*"; exit 1; }
 
-hdr() { _is_tty && printf "%s%s%s\n" "$c_bold$c_cyan" "$*" "$c_reset" || echo "$*"; }
-key() { _is_tty && printf "%s%s%s" "$c_mag" "$*" "$c_reset" || printf "%s" "$*"; }
-val() { _is_tty && printf "%s%s%s" "$c_bold" "$*" "$c_reset" || printf "%s" "$*"; }
+hdr() { echo; color "$c_bold$c_cyan" "$*"; echo; }
 
 host_short() { hostname -s 2>/dev/null || hostname; }
 
@@ -130,11 +131,7 @@ latest_backup_dir() {
 ###############################################################################
 to_int() {
   local s="${1:-}"
-  if [[ "$s" =~ ^[0-9]+$ ]]; then
-    echo "$s"
-  else
-    echo 0
-  fi
+  if [[ "$s" =~ ^[0-9]+$ ]]; then echo "$s"; else echo 0; fi
 }
 imax() {
   local a b
@@ -229,7 +226,7 @@ snapshot_after() {
 }
 
 ###############################################################################
-# Tiered selection (RAM + CPU), and disk-aware logging caps
+# Tier selection (RAM + CPU) + disk-aware log caps
 ###############################################################################
 ceil_gib() { local mem_mb="$1"; echo $(( (mem_mb + 1023) / 1024 )); }
 
@@ -276,7 +273,7 @@ tier_max() {
   if [[ "$ra" -ge "$rb" ]]; then echo "$a"; else echo "$b"; fi
 }
 
-# Conntrack: not too low for small VPS
+# Conntrack soft formula:
 # ct_soft = RAM_MiB * 64 + CPU * 8192
 ct_soft_from_ram_cpu() {
   local mem_mb="$1" cpu="$2"
@@ -310,87 +307,80 @@ pick_log_caps() {
 }
 
 ###############################################################################
-# Output tables
+# Output helpers
 ###############################################################################
+row_kv() { # key width 12
+  local k="$1" v="$2"
+  printf "%-12s | %s\n" "$k" "$v"
+}
+
 print_run_table() {
   local mode="$1" profile="$2" backup="$3"
   local cpu="$4" mem_mb="$5" gib="$6"
   local ram_tier="$7" cpu_tier="$8" tier="$9"
   local disk_mb="${10}" jcap="${11}" lrrot="${12}"
 
-  echo
   hdr "Run"
-  printf "%-12s | %s\n" "$(key Host)"   "$(val "$(host_short)")"
-  printf "%-12s | %s\n" "$(key Mode)"   "$(val "$mode")"
-  printf "%-12s | %s\n" "$(key CPU)"    "$(val "${cpu:-"-"}")"
-  printf "%-12s | %s MiB (~%s GiB)\n" "$(key RAM)" "$(val "${mem_mb:-"-"}")" "$(val "${gib:-"-"}")"
-  printf "%-12s | %s MB\n" "$(key Disk(/var))" "$(val "${disk_mb:-"-"}")"
-  printf "%-12s | %s (RAM %s / CPU %s)\n" "$(key Tier)" \
-    "$(val "${tier:-"-"}")" "$(val "${ram_tier:-"-"}")" "$(val "${cpu_tier:-"-"}")"
+  row_kv "Host"       "$(color "$c_bold" "$(host_short)")"
+  row_kv "Mode"       "$(color "$c_bold" "$mode")"
+  row_kv "CPU"        "$(color "$c_bold" "$cpu")"
+  row_kv "RAM"        "$(color "$c_bold" "${mem_mb} MiB (~${gib} GiB)")"
+  row_kv "Disk(/var)" "$(color "$c_bold" "${disk_mb} MB")"
+  row_kv "Tier"       "$(color "$c_bold" "${tier}") (RAM ${ram_tier} / CPU ${cpu_tier})"
+  row_kv "Profile"    "$(color "$c_bold" "$profile")"
+  row_kv "Journald"   "$(color "$c_bold" "$jcap")"
+  row_kv "Logrotate"  "$(color "$c_bold" "rotate ${lrrot}")"
+  row_kv "Backup"     "$(color "$c_bold" "$backup")"
 
-  echo
   hdr "Why this tier"
   echo "  RAM ~${gib} GiB -> RAM tier ${ram_tier}"
   echo "  CPU ${cpu} -> CPU tier ${cpu_tier}"
   echo "  Final tier = max(RAM tier, CPU tier) = ${tier}"
 
-  echo
-  printf "%-12s | %s\n" "$(key Profile)"      "$(val "${profile:-"-"}")"
-  printf "%-12s | %s\n" "$(key Journald cap)" "$(val "${jcap:-"-"}")"
-  printf "%-12s | rotate %s\n" "$(key Logrotate)" "$(val "${lrrot:-"-"}")"
-  printf "%-12s | %s\n" "$(key Backup)"       "$(val "${backup:-"-"}")"
-
-  echo
   hdr "Verdict"
   echo "  Tier ${tier} -> profile ${profile} looks OK for CPU=${cpu}, RAM~${gib} GiB, disk(/var)=${disk_mb} MB."
 }
 
 print_planned_table() {
-  echo
   hdr "Planned (computed targets)"
-  printf "%-16s | %s\n" "TCP"           "${P_TCP_CC}"
-  printf "%-16s | %s\n" "Qdisc"         "${P_QDISC}"
-  printf "%-16s | %s\n" "Forward"       "${P_FWD}"
-  printf "%-16s | %s\n" "Conntrack"     "${P_CT_FINAL} (soft ${P_CT_SOFT}, clamp ${P_CT_CLAMPED})"
-  printf "%-16s | %s\n" "TW buckets"    "${P_TW_FINAL}"
-  printf "%-16s | %s\n" "Nofile"        "${P_NOFILE_FINAL}"
-  printf "%-16s | %s\n" "Swappiness"    "${P_SWAPPINESS}"
-  printf "%-16s | %s\n" "Journald cap"  "${P_JOURNAL_CAP}"
-  printf "%-16s | %s\n" "Logrotate"     "rotate ${P_LR_ROTATE}"
-  printf "%-16s | %s\n" "Auto reboot"   "false"
-  printf "%-16s | %s\n" "Reboot time"   "04:00"
+  row_kv "TCP"         "${P_TCP_CC}"
+  row_kv "Qdisc"       "${P_QDISC}"
+  row_kv "Forward"     "${P_FWD}"
+  row_kv "Conntrack"   "${P_CT_FINAL} (soft ${P_CT_SOFT}, clamp ${P_CT_CLAMPED})"
+  row_kv "TW buckets"  "${P_TW_FINAL}"
+  row_kv "Nofile"      "${P_NOFILE_FINAL}"
+  row_kv "Swappiness"  "${P_SWAPPINESS}"
+  row_kv "Journald"    "${P_JOURNAL_CAP}"
+  row_kv "Logrotate"   "rotate ${P_LR_ROTATE}"
+  row_kv "Auto reboot" "false"
+  row_kv "Reboot time" "04:00"
 }
 
 print_before_after_all() {
-  echo
   hdr "Before -> After (all)"
   printf "%-12s-+-%-24s-+-%-24s\n" "$(printf '%.0s-' {1..12})" "$(printf '%.0s-' {1..24})" "$(printf '%.0s-' {1..24})"
 
-  row() {
+  row3() {
     local k="$1" b="$2" a="$3"
     if [[ "$b" != "$a" ]]; then
-      if _is_tty; then
-        printf "%-12s | %s%-24s%s | %s%-24s%s\n" "$k" "$c_grn" "$b" "$c_reset" "$c_grn" "$a" "$c_reset"
-      else
-        printf "%-12s | %-24s | %-24s\n" "$k" "$b" "$a"
-      fi
+      printf "%-12s | %-24s | %-24s\n" "$k" "$(color "$c_grn" "$b")" "$(color "$c_grn" "$a")"
     else
       printf "%-12s | %-24s | %-24s\n" "$k" "$b" "$a"
     fi
   }
 
-  row "TCP"        "$B_TCP_CC" "$A_TCP_CC"
-  row "Qdisc"      "$B_QDISC" "$A_QDISC"
-  row "Forward"    "$B_FWD" "$A_FWD"
-  row "Conntrack"  "$B_CT_MAX" "$A_CT_MAX"
-  row "TW buckets" "$B_TW" "$A_TW"
-  row "Swappiness" "$B_SWAPPINESS" "$A_SWAPPINESS"
-  row "Swap"       "$B_SWAP" "$A_SWAP"
-  row "Nofile"     "$B_NOFILE" "$A_NOFILE"
-  row "Journald"   "$B_JOURNAL" "$A_JOURNAL"
-  row "Logrotate"  "$B_LOGROT" "$A_LOGROT"
-  row "Auto reboot" "$(_unattended_state "$B_UNATT")" "$(_unattended_state "$A_UNATT")"
-  row "Reboot time" "$(_unattended_time "$B_UNATT")"  "$(_unattended_time "$A_UNATT")"
+  row3 "TCP"        "$B_TCP_CC" "$A_TCP_CC"
+  row3 "Qdisc"      "$B_QDISC" "$A_QDISC"
+  row3 "Forward"    "$B_FWD" "$A_FWD"
+  row3 "Conntrack"  "$B_CT_MAX" "$A_CT_MAX"
+  row3 "TW buckets" "$B_TW" "$A_TW"
+  row3 "Swappiness" "$B_SWAPPINESS" "$A_SWAPPINESS"
+  row3 "Swap"       "$B_SWAP" "$A_SWAP"
+  row3 "Nofile"     "$B_NOFILE" "$A_NOFILE"
+  row3 "Journald"   "$B_JOURNAL" "$A_JOURNAL"
+  row3 "Logrotate"  "$B_LOGROT" "$A_LOGROT"
+  row3 "Auto reboot" "$(_unattended_state "$B_UNATT")" "$(_unattended_state "$A_UNATT")"
+  row3 "Reboot time" "$(_unattended_time "$B_UNATT")"  "$(_unattended_time "$A_UNATT")"
 }
 
 print_manifest_compact() {
@@ -400,13 +390,11 @@ print_manifest_compact() {
   copies="$(awk -F'\t' '$1=="COPY"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
   moves="$(awk -F'\t' '$1=="MOVE"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
 
-  echo
   hdr "Files"
   echo "  backed up:   $copies"
   echo "  moved aside: $moves"
 
   if [[ "$moves" -gt 0 ]]; then
-    echo
     hdr "Moved aside"
     awk -F'\t' '$1=="MOVE"{print "  - " $2}' "$man" | head -n 50
     [[ "$moves" -gt 50 ]] && echo "  (showing first 50)"
@@ -559,7 +547,7 @@ apply_cmd() {
   ct_final="$(imax "$current_ct" "$ct_clamped")"
   local ct_buckets=$((ct_final/4)); [[ "$ct_buckets" -lt 4096 ]] && ct_buckets=4096
 
-  # Populate "planned" globals for printing
+  # Planned globals
   P_TCP_CC="bbr"
   P_QDISC="fq"
   P_FWD="1"
@@ -864,32 +852,30 @@ rollback_cmd() {
   snapshot_after
 
   ok "Rolled back. Backup used: $backup"
-  echo
   hdr "Run"
-  printf "%-12s | %s\n" "$(key Host)"   "$(val "$(host_short)")"
-  printf "%-12s | %s\n" "$(key Mode)"   "$(val "rollback")"
-  printf "%-12s | %s\n" "$(key Backup)" "$(val "$backup")"
+  row_kv "Host"   "$(color "$c_bold" "$(host_short)")"
+  row_kv "Mode"   "$(color "$c_bold" "rollback")"
+  row_kv "Backup" "$(color "$c_bold" "$backup")"
   print_before_after_all
   print_manifest_compact "$man"
 }
 
 status_cmd() {
   snapshot_before
-  echo
   hdr "Current"
-  printf "%-12s | %s\n" "$(key Host)"       "$(val "$(host_short)")"
-  printf "%-12s | %s\n" "$(key TCP)"        "$(val "$B_TCP_CC")"
-  printf "%-12s | %s\n" "$(key Qdisc)"      "$(val "$B_QDISC")"
-  printf "%-12s | %s\n" "$(key Forward)"    "$(val "$B_FWD")"
-  printf "%-12s | %s\n" "$(key Conntrack)"  "$(val "$B_CT_MAX")"
-  printf "%-12s | %s\n" "$(key TW buckets)" "$(val "$B_TW")"
-  printf "%-12s | %s\n" "$(key Swappiness)" "$(val "$B_SWAPPINESS")"
-  printf "%-12s | %s\n" "$(key Swap)"       "$(val "$B_SWAP")"
-  printf "%-12s | %s\n" "$(key Nofile)"     "$(val "$B_NOFILE")"
-  printf "%-12s | %s\n" "$(key Journald)"   "$(val "$B_JOURNAL")"
-  printf "%-12s | %s\n" "$(key Logrotate)"  "$(val "$B_LOGROT")"
-  printf "%-12s | %s\n" "$(key AutoReboot)" "$(val "$(_unattended_state "$B_UNATT")")"
-  printf "%-12s | %s\n" "$(key RebootTime)" "$(val "$(_unattended_time "$B_UNATT")")"
+  row_kv "Host"       "$(color "$c_bold" "$(host_short)")"
+  row_kv "TCP"        "$B_TCP_CC"
+  row_kv "Qdisc"      "$B_QDISC"
+  row_kv "Forward"    "$B_FWD"
+  row_kv "Conntrack"  "$B_CT_MAX"
+  row_kv "TW buckets" "$B_TW"
+  row_kv "Swappiness" "$B_SWAPPINESS"
+  row_kv "Swap"       "$B_SWAP"
+  row_kv "Nofile"     "$B_NOFILE"
+  row_kv "Journald"   "$B_JOURNAL"
+  row_kv "Logrotate"  "$B_LOGROT"
+  row_kv "AutoReboot" "$(_unattended_state "$B_UNATT")"
+  row_kv "RebootTime" "$(_unattended_time "$B_UNATT")"
 }
 
 case "${1:-}" in
