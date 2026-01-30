@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-One command to tune a Linux VPS or VDS for **lots of concurrent connections**
+One command to tune a Linux VPS or VDS for lots of concurrent connections
 (for example, a VPN server).
 
 The script automatically selects a profile based on hardware, creates a backup,
@@ -22,15 +22,15 @@ sudo bash initial.sh rollback
 
 ## What it does
 
-- Enables **BBR + fq**
+- Enables BBR + fq
 - Raises network limits for high-connection workloads
-- Enables **IP forwarding**
-- Tunes **conntrack** for many concurrent connections
-- Increases **NOFILE** limits
-- Creates or resizes **/swapfile** if needed
-- Limits **journald** disk usage based on disk size
-- Configures **logrotate**
-- Disables unattended-upgrades **automatic reboot**
+- Enables IP forwarding
+- Tunes conntrack for many concurrent connections
+- Increases NOFILE limits
+- Creates or resizes /swapfile if needed
+- Limits journald disk usage based on disk size
+- Configures logrotate
+- Disables unattended-upgrades automatic reboot
 
 All changes are applied safely and can be fully reverted.
 
@@ -38,7 +38,7 @@ All changes are applied safely and can be fully reverted.
 
 ## When NOT to use
 
-Do **NOT** use this script if:
+Do NOT use this script if:
 
 - this is a database server with strict latency requirements
 - you already have custom kernel or network tuning you want to keep
@@ -49,50 +49,99 @@ Do **NOT** use this script if:
 
 ## Commands
 
-- `apply` â apply tuning and create a backup
-- `rollback` â undo changes using a backup
-- `status` â show current tuning state
+- `apply` - apply tuning and create a backup
+- `rollback` - undo changes using a backup
+- `status` - show current tuning state
 
-Examples:
+---
+
+## How to verify
+
+After running `apply`, you can quickly check that tuning was applied.
+
+### Check TCP congestion control and qdisc
 
 ```bash
-sudo bash initial.sh apply
-sudo bash initial.sh rollback
-sudo bash initial.sh status
+sysctl net.ipv4.tcp_congestion_control
+sysctl net.core.default_qdisc
 ```
 
-Using curl:
+Expected:
+```
+bbr
+fq
+```
+
+### Check conntrack limits
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | sudo bash -s -- apply
+sysctl net.netfilter.nf_conntrack_max
+cat /proc/sys/net/netfilter/nf_conntrack_count
+```
+
+The count value should be lower than the max.
+
+### Check NOFILE limits
+
+```bash
+ulimit -n
+systemctl show --property DefaultLimitNOFILE
+```
+
+### Check swap
+
+```bash
+swapon --show
+free -h
+```
+
+### Check journald usage
+
+```bash
+journalctl --disk-usage
+```
+
+### Check IP forwarding
+
+```bash
+sysctl net.ipv4.ip_forward
+```
+
+Expected:
+```
+1
+```
+
+### Check applied profile
+
+```bash
+sudo bash initial.sh status
 ```
 
 ---
 
 ## Automatic profiles
 
-The script detects CPU and RAM and maps them to common VPS âtiersâ.
+The script detects CPU and RAM and maps them to common VPS tiers.
 
 ### Hardware detection
 
-- CPU cores: `nproc`
-- RAM: `/proc/meminfo` (MiB)
-- Disk size for logs: `df -Pm /var/log` (fallback: `/`)
+- CPU cores: nproc
+- RAM: /proc/meminfo (MiB)
+- Disk size for logs: df -Pm /var/log (fallback: /)
 
 ### Tiering rules
 
-- **RAM** is rounded **up** to the next whole GiB and mapped to tiers  
-  (1, 2, 4, 8, 16, 32, 64+)
-- **CPU** is mapped to the same tiers  
-  (1, 2, 4, 8, 16, 32, 64+)
+- RAM is rounded up to the next whole GiB
+- CPU is mapped to the same tier scale
 
 Final tier is:
 
-**tier = max(RAM tier, CPU tier)**
+tier = max(RAM tier, CPU tier)
 
 This prevents selecting a profile that is too weak for the hardware.
 
-### Tier â profile mapping
+### Tier to profile mapping
 
 | Tier | Profile |
 |------|---------|
@@ -104,60 +153,37 @@ This prevents selecting a profile that is too weak for the hardware.
 | 32   | dedicated |
 | 64+  | dedicated+ |
 
-Manual override:
-
-```bash
-FORCE_PROFILE=high sudo bash initial.sh apply
-```
-
-Supported values:  
-`low`, `mid`, `high`, `xhigh`, `2xhigh`, `dedicated`, `dedicated+`
-
 ---
 
 ## Profiles table
 
-This table shows the most important limits for workloads with many connections.
-
-| Profile     | Typical tier | Conntrack max | NOFILE     | Swap (if no partition) |
-|------------|--------------|---------------|------------|-------------------------|
-| low        | 1            | 65,536        | 65,536     | ~1 GB |
-| mid        | 2            | 131,072       | 131,072    | ~2 GB |
-| high       | 4            | 262,144       | 262,144    | ~4 GB |
-| xhigh      | 8            | 524,288       | 524,288    | ~6 GB |
-| 2xhigh     | 16           | 1,048,576     | 1,048,576  | ~8 GB |
-| dedicated  | 32           | 2,097,152     | 2,097,152  | ~8 GB |
-| dedicated+ | 64+          | 4,194,304     | 4,194,304  | ~8 GB |
-
-Notes:
-
-- Swap is only created or resized if there is **no swap partition**
-- Conntrack size is computed from RAM and CPU, then limited to the profile range
-- Existing limits are **never decreased**
+| Profile     | Conntrack max | NOFILE     | Swap |
+|------------|---------------|------------|------|
+| low        | 65536         | 65536      | ~1 GB |
+| mid        | 131072        | 131072     | ~2 GB |
+| high       | 262144        | 262144     | ~4 GB |
+| xhigh      | 524288        | 524288     | ~6 GB |
+| 2xhigh     | 1048576       | 1048576    | ~8 GB |
+| dedicated  | 2097152       | 2097152    | ~8 GB |
+| dedicated+ | 4194304       | 4194304    | ~8 GB |
 
 ---
 
 ## Backups and rollback
 
-Each `apply` creates a backup directory:
+Each apply creates a backup directory:
 
 ```
 /root/edge-tuning-backup-YYYYMMDD-HHMMSS
 ```
 
-It contains:
-
-- `files/` â copies of original configuration files
-- `moved/` â conflicting configs moved aside
-- `MANIFEST.tsv` â exact restore instructions
-
-Rollback (latest backup):
+Rollback latest:
 
 ```bash
 sudo bash initial.sh rollback
 ```
 
-Rollback (specific backup):
+Rollback specific:
 
 ```bash
 sudo BACKUP_DIR=/root/edge-tuning-backup-YYYYMMDD-HHMMSS bash initial.sh rollback
