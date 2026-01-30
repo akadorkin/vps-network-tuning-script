@@ -7,6 +7,12 @@
 >
 > Always review the script before running it on production systems.
 
+## Supported systems
+
+Tested on **Ubuntu** (20.04, 22.04, 24.04).
+
+Other Linux distributions are untested.
+
 ## TL;DR
 
 One command to tune a Linux VPS or VDS for lots of concurrent connections
@@ -14,6 +20,7 @@ One command to tune a Linux VPS or VDS for lots of concurrent connections
 
 The script automatically selects a profile based on hardware, creates a backup,
 and allows you to roll everything back.
+
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | sudo bash -s -- apply
