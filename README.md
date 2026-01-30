@@ -1,5 +1,11 @@
 # VPS Network Tuning Script
-
+> **Disclaimer**
+>
+> This script is provided **as is**, without any warranties or guarantees of any kind.
+> You run it **at your own risk**.
+>
+> Always review the script before running it on production systems.
+> 
 ## TL;DR
 
 One command to tune a Linux VPS or VDS for lots of concurrent connections
