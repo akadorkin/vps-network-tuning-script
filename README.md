@@ -1,11 +1,12 @@
 # VPS Network Tuning Script
-> **Disclaimer**
+
+> Disclaimer
 >
-> This script is provided **as is**, without any warranties or guarantees of any kind.
-> You run it **at your own risk**.
+> This script is provided as is, without any warranties or guarantees of any kind.
+> You run it at your own risk.
 >
 > Always review the script before running it on production systems.
-> 
+
 ## TL;DR
 
 One command to tune a Linux VPS or VDS for lots of concurrent connections
@@ -16,12 +17,6 @@ and allows you to roll everything back.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | sudo bash -s -- apply
-```
-
-Rollback (latest backup):
-
-```bash
-sudo bash initial.sh rollback
 ```
 
 ---
@@ -42,30 +37,47 @@ All changes are applied safely and can be fully reverted.
 
 ---
 
-## When NOT to use
+## Usage
 
-Do NOT use this script if:
+Apply tuning (creates a backup automatically):
 
-- this is a database server with strict latency requirements
-- you already have custom kernel or network tuning you want to keep
-- this is not a VPS/server (for example, embedded systems)
-- you are not sure what you are doing (review the script first)
+```bash
+curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | sudo bash -s -- apply
+```
+
+Show current state:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | sudo bash -s -- status
+```
+
+Rollback to the latest backup:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/akadorkin/vps-network-tuning-script/main/initial.sh | sudo bash -s -- rollback
+```
+
+Rollback to a specific backup (local script):
+
+```bash
+sudo BACKUP_DIR=/root/edge-tuning-backup-YYYYMMDD-HHMMSS bash initial.sh rollback
+```
 
 ---
 
 ## Commands
 
-- `apply` - apply tuning and create a backup
-- `rollback` - undo changes using a backup
-- `status` - show current tuning state
+- apply - apply tuning and create a backup
+- rollback - undo changes using a backup
+- status - show current tuning state
 
 ---
 
 ## How to verify
 
-After running `apply`, you can quickly check that tuning was applied.
+After running apply, you can quickly check that tuning was applied.
 
-### Check TCP congestion control and qdisc
+Check TCP congestion control and qdisc:
 
 ```bash
 sysctl net.ipv4.tcp_congestion_control
@@ -78,36 +90,34 @@ bbr
 fq
 ```
 
-### Check conntrack limits
+Check conntrack limits:
 
 ```bash
 sysctl net.netfilter.nf_conntrack_max
 cat /proc/sys/net/netfilter/nf_conntrack_count
 ```
 
-The count value should be lower than the max.
-
-### Check NOFILE limits
+Check NOFILE limits:
 
 ```bash
 ulimit -n
 systemctl show --property DefaultLimitNOFILE
 ```
 
-### Check swap
+Check swap:
 
 ```bash
 swapon --show
 free -h
 ```
 
-### Check journald usage
+Check journald usage:
 
 ```bash
 journalctl --disk-usage
 ```
 
-### Check IP forwarding
+Check IP forwarding:
 
 ```bash
 sysctl net.ipv4.ip_forward
@@ -118,7 +128,7 @@ Expected:
 1
 ```
 
-### Check applied profile
+Check applied profile:
 
 ```bash
 sudo bash initial.sh status
@@ -130,24 +140,21 @@ sudo bash initial.sh status
 
 The script detects CPU and RAM and maps them to common VPS tiers.
 
-### Hardware detection
-
+Hardware detection:
 - CPU cores: nproc
 - RAM: /proc/meminfo (MiB)
 - Disk size for logs: df -Pm /var/log (fallback: /)
 
-### Tiering rules
-
+Tiering rules:
 - RAM is rounded up to the next whole GiB
 - CPU is mapped to the same tier scale
 
-Final tier is:
-
+Final tier:
 tier = max(RAM tier, CPU tier)
 
 This prevents selecting a profile that is too weak for the hardware.
 
-### Tier to profile mapping
+Tier to profile mapping:
 
 | Tier | Profile |
 |------|---------|
@@ -173,6 +180,11 @@ This prevents selecting a profile that is too weak for the hardware.
 | dedicated  | 2097152       | 2097152    | ~8 GB |
 | dedicated+ | 4194304       | 4194304    | ~8 GB |
 
+Notes:
+- Swap is only created or resized if there is no swap partition
+- Conntrack size is computed from RAM and CPU, then limited to the profile range
+- Existing limits are never decreased
+
 ---
 
 ## Backups and rollback
@@ -194,6 +206,16 @@ Rollback specific:
 ```bash
 sudo BACKUP_DIR=/root/edge-tuning-backup-YYYYMMDD-HHMMSS bash initial.sh rollback
 ```
+
+---
+
+## When NOT to use
+
+Do NOT use this script if:
+- this is a database server with strict latency requirements
+- you already have custom kernel or network tuning you want to keep
+- this is not a VPS/server (for example, embedded systems)
+- you are not sure what you are doing
 
 ---
 
