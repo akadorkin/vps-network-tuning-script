@@ -396,7 +396,8 @@ print_manifest_compact() {
 
   if [[ "$moves" -gt 0 ]]; then
     hdr "Moved aside"
-    awk -F'\t' '$1=="MOVE"{print "  - " $2}' "$man" | head -n 50
+    # NOTE: sed avoids SIGPIPE issues with pipefail (head can make awk exit non-zero)
+    awk -F'\t' '$1=="MOVE"{print "  - " $2}' "$man" | sed -n '1,50p'
     [[ "$moves" -gt 50 ]] && echo "  (showing first 50)"
   fi
 }
@@ -617,6 +618,8 @@ apply_cmd() {
     [[ -f "$f" ]] || continue
     case "$f" in
       /etc/sysctl.d/90-edge-network.conf|/etc/sysctl.d/92-edge-safe.conf|/etc/sysctl.d/95-edge-forward.conf|/etc/sysctl.d/96-edge-vm.conf|/etc/sysctl.d/99-edge-conntrack.conf) continue ;;
+      # Do not touch Tailscale sysctl snippets (avoid breaking tailscale-managed settings)
+      /etc/sysctl.d/*tailscale*.conf|/etc/sysctl.d/99-tailscale-forwarding.conf) continue ;;
     esac
     if grep -Eq 'nf_conntrack_|tcp_congestion_control|default_qdisc|ip_forward|somaxconn|netdev_max_backlog|tcp_rmem|tcp_wmem|rmem_max|wmem_max|vm\.swappiness|vfs_cache_pressure|tcp_syncookies|tcp_max_tw_buckets|tcp_keepalive|tcp_mtu_probing|tcp_fin_timeout|tcp_tw_reuse|tcp_slow_start_after_idle|tcp_rfc1337' "$f"; then
       move_aside "$f"
