@@ -15,6 +15,10 @@ set -Eeuo pipefail
 # - Sysctl move-aside: keep original behavior, but made the matching more focused.
 #   You can disable sysctl move-aside entirely with:
 #     EDGE_SYSCTL_MOVE=0
+#
+# Hardening fix:
+# - print_manifest_compact(): numeric comparisons are now safe even if parsing
+#   yields empty values (prevents [[ ... -gt ... ]] from triggering ERR under -eE).
 ###############################################################################
 
 ###############################################################################
@@ -34,16 +38,20 @@ c_cyan=$'\033[36m'
 
 color() { # color <ansi> <text>
   local code="$1"; shift
-  if _is_tty; then printf "%s%s%s" "$code" "$*" "$c_reset"; else printf "%s" "$*"; fi
+  if _is_tty; then
+    printf "%s%s%s" "$code" "$*" "$c_reset"
+  else
+    printf "%s" "$*"
+  fi
 }
 
 _pfx() { _is_tty && printf "%s%s%s" "${c_dim}" "$(ts) " "${c_reset}" || true; }
-ok()   { _pfx; color "$c_grn" "OK";   printf " %s\n" "$*"; }
-warn() { _pfx; color "$c_yel" "WARN"; printf " %s\n" "$*"; }
-err()  { _pfx; color "$c_red" "ERROR";printf " %s\n" "$*"; }
+ok()   { _pfx; color "$c_grn" "OK";    printf " %s\n" "$*"; }
+warn() { _pfx; color "$c_yel" "WARN";  printf " %s\n" "$*"; }
+err()  { _pfx; color "$c_red" "ERROR"; printf " %s\n" "$*"; }
 die()  { err "$*"; exit 1; }
 
-hdr() { echo; color "$c_bold$c_cyan" "$*"; echo; }
+hdr() { echo; color "${c_bold}${c_cyan}" "$*"; echo; }
 
 host_short() { hostname -s 2>/dev/null || hostname; }
 
@@ -407,16 +415,16 @@ print_before_after_all() {
     fi
   }
 
-  row3 "TCP"        "$B_TCP_CC" "$A_TCP_CC"
-  row3 "Qdisc"      "$B_QDISC" "$A_QDISC"
-  row3 "Forward"    "$B_FWD" "$A_FWD"
-  row3 "Conntrack"  "$B_CT_MAX" "$A_CT_MAX"
-  row3 "TW buckets" "$B_TW" "$A_TW"
-  row3 "Swappiness" "$B_SWAPPINESS" "$A_SWAPPINESS"
-  row3 "Swap"       "$B_SWAP" "$A_SWAP"
-  row3 "Nofile"     "$B_NOFILE" "$A_NOFILE"
-  row3 "Journald"   "$B_JOURNAL" "$A_JOURNAL"
-  row3 "Logrotate"  "$B_LOGROT" "$A_LOGROT"
+  row3 "TCP"         "$B_TCP_CC" "$A_TCP_CC"
+  row3 "Qdisc"       "$B_QDISC" "$A_QDISC"
+  row3 "Forward"     "$B_FWD" "$A_FWD"
+  row3 "Conntrack"   "$B_CT_MAX" "$A_CT_MAX"
+  row3 "TW buckets"  "$B_TW" "$A_TW"
+  row3 "Swappiness"  "$B_SWAPPINESS" "$A_SWAPPINESS"
+  row3 "Swap"        "$B_SWAP" "$A_SWAP"
+  row3 "Nofile"      "$B_NOFILE" "$A_NOFILE"
+  row3 "Journald"    "$B_JOURNAL" "$A_JOURNAL"
+  row3 "Logrotate"   "$B_LOGROT" "$A_LOGROT"
   row3 "Auto reboot" "$(_unattended_state "$B_UNATT")" "$(_unattended_state "$A_UNATT")"
   row3 "Reboot time" "$(_unattended_time "$B_UNATT")"  "$(_unattended_time "$A_UNATT")"
 }
@@ -435,23 +443,34 @@ print_manifest_compact() {
   [[ -f "$man" ]] || return 0
 
   local copies moves
-  read -r copies moves < <(_manifest_counts "$man")
+  read -r copies moves < <(_manifest_counts "$man") || true
 
   local show="${EDGE_MOVE_SHOW:-50}"
   local warn_at="${EDGE_MOVE_WARN:-50}"
 
-  hdr "Files"
-  echo "  backed up:   $copies"
-  echo "  moved aside: $moves"
+  # harden: ensure integers even if parsing yields empty
+  local moves_i show_i warn_i copies_i
+  copies_i="$(to_int "${copies:-0}")"
+  moves_i="$(to_int "${moves:-0}")"
+  show_i="$(to_int "${show:-50}")"
+  warn_i="$(to_int "${warn_at:-50}")"
+  [[ "$show_i" -le 0 ]] && show_i=50
 
-  if [[ "$moves" -gt 0 ]]; then
-    if [[ "$moves" -gt "$warn_at" ]]; then
-      warn "Many files moved aside (${moves}). This is not fatal. Showing first ${show}."
+  hdr "Files"
+  echo "  backed up:   $copies_i"
+  echo "  moved aside: $moves_i"
+
+  if [[ "$moves_i" -gt 0 ]]; then
+    if [[ "$moves_i" -gt "$warn_i" ]]; then
+      warn "Many files moved aside (${moves_i}). This is not fatal. Showing first ${show_i}."
     fi
 
     hdr "Moved aside"
-    awk -F'\t' '$1=="MOVE"{print "  - " $2}' "$man" | sed -n "1,${show}p"
-    [[ "$moves" -gt "$show" ]] && echo "  (showing first ${show})"
+    awk -F'\t' '$1=="MOVE"{print "  - " $2}' "$man" | sed -n "1,${show_i}p"
+
+    if [[ "$moves_i" -gt "$show_i" ]]; then
+      echo "  (showing first ${show_i})"
+    fi
   fi
 }
 
@@ -788,7 +807,7 @@ EOM
   shopt -s nullglob
   for f in /etc/systemd/journald.conf.d/*.conf; do
     [[ "$f" == "/etc/systemd/journald.conf.d/90-edge.conf" ]] && continue
-    # Move aside ONLY if the file touches keys we manage (avoid moving unrelated journald settings)
+    # Move aside ONLY if the file touches keys we manage
     if grep -Eq '^\s*(SystemMaxUse|RuntimeMaxUse|RateLimitIntervalSec|RateLimitBurst|Compress)\s*=' "$f"; then
       move_aside "$f"
     fi
