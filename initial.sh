@@ -2,6 +2,22 @@
 set -Eeuo pipefail
 
 ###############################################################################
+# VPS Network Tuning Script (external)
+#
+# Patch notes (your requested “tune”):
+# - Removed any "fatal" behavior when many files are moved aside (no more apply fail
+#   just because moved count is high).
+# - Added soft thresholds:
+#     EDGE_MOVE_WARN=50   (warn when moved_aside count exceeds this)
+#     EDGE_MOVE_SHOW=50   (how many moved paths to print)
+# - Journald: DO NOT move aside every *.conf in journald.conf.d.
+#   Move aside only those that conflict with keys we manage.
+# - Sysctl move-aside: keep original behavior, but made the matching more focused.
+#   You can disable sysctl move-aside entirely with:
+#     EDGE_SYSCTL_MOVE=0
+###############################################################################
+
+###############################################################################
 # Logging + colors
 ###############################################################################
 LOG_TS="${EDGE_LOG_TS:-1}"
@@ -405,21 +421,37 @@ print_before_after_all() {
   row3 "Reboot time" "$(_unattended_time "$B_UNATT")"  "$(_unattended_time "$A_UNATT")"
 }
 
-print_manifest_compact() {
+_manifest_counts() {
   local man="$1"
-  [[ -f "$man" ]] || return 0
+  [[ -f "$man" ]] || { echo "0 0"; return 0; }
   local copies moves
   copies="$(awk -F'\t' '$1=="COPY"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
   moves="$(awk -F'\t' '$1=="MOVE"{c++} END{print c+0}' "$man" 2>/dev/null || echo 0)"
+  echo "$copies $moves"
+}
+
+print_manifest_compact() {
+  local man="$1"
+  [[ -f "$man" ]] || return 0
+
+  local copies moves
+  read -r copies moves < <(_manifest_counts "$man")
+
+  local show="${EDGE_MOVE_SHOW:-50}"
+  local warn_at="${EDGE_MOVE_WARN:-50}"
 
   hdr "Files"
   echo "  backed up:   $copies"
   echo "  moved aside: $moves"
 
   if [[ "$moves" -gt 0 ]]; then
+    if [[ "$moves" -gt "$warn_at" ]]; then
+      warn "Many files moved aside (${moves}). This is not fatal. Showing first ${show}."
+    fi
+
     hdr "Moved aside"
-    awk -F'\t' '$1=="MOVE"{print "  - " $2}' "$man" | sed -n '1,50p'
-    [[ "$moves" -gt 50 ]] && echo "  (showing first 50)"
+    awk -F'\t' '$1=="MOVE"{print "  - " $2}' "$man" | sed -n "1,${show}p"
+    [[ "$moves" -gt "$show" ]] && echo "  (showing first ${show})"
   fi
 }
 
@@ -639,6 +671,10 @@ apply_cmd() {
 
   # ---- sysctl ----
   backup_file /etc/sysctl.conf
+
+  # Optional: disable sysctl move-aside completely
+  local sysctl_move="${EDGE_SYSCTL_MOVE:-1}"
+
   shopt -s nullglob
   for f in /etc/sysctl.d/*.conf; do
     [[ -f "$f" ]] || continue
@@ -646,7 +682,11 @@ apply_cmd() {
       /etc/sysctl.d/90-edge-network.conf|/etc/sysctl.d/92-edge-safe.conf|/etc/sysctl.d/95-edge-forward.conf|/etc/sysctl.d/96-edge-vm.conf|/etc/sysctl.d/99-edge-conntrack.conf) continue ;;
       /etc/sysctl.d/*tailscale*.conf|/etc/sysctl.d/99-tailscale-forwarding.conf) continue ;;
     esac
-    if grep -Eq 'nf_conntrack_|tcp_congestion_control|default_qdisc|ip_forward|somaxconn|netdev_max_backlog|tcp_rmem|tcp_wmem|rmem_max|wmem_max|vm\.swappiness|vfs_cache_pressure|tcp_syncookies|tcp_max_tw_buckets|tcp_keepalive|tcp_mtu_probing|tcp_fin_timeout|tcp_tw_reuse|tcp_slow_start_after_idle|tcp_rfc1337' "$f"; then
+
+    [[ "$sysctl_move" == "1" ]] || continue
+
+    # Focused match: only keys we actually manage here
+    if grep -Eq '^\s*(net\.netfilter\.nf_conntrack_|net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc|net\.ipv4\.ip_forward|net\.core\.somaxconn|net\.core\.netdev_max_backlog|net\.ipv4\.tcp_max_syn_backlog|net\.ipv4\.tcp_(rmem|wmem)|net\.core\.(rmem|wmem)_(max|default)|vm\.swappiness|vm\.vfs_cache_pressure|net\.ipv4\.tcp_syncookies|net\.ipv4\.tcp_max_tw_buckets|net\.ipv4\.tcp_rfc1337|net\.ipv4\.tcp_keepalive_|net\.ipv4\.tcp_mtu_probing|net\.ipv4\.tcp_fin_timeout|net\.ipv4\.tcp_tw_reuse|net\.ipv4\.tcp_slow_start_after_idle)\s*=' "$f"; then
       move_aside "$f"
     fi
   done
@@ -654,7 +694,7 @@ apply_cmd() {
 
   if [[ -f /etc/sysctl.conf ]]; then
     sed -i -E \
-      's/^\s*(net\.netfilter\.nf_conntrack_|net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc|net\.ipv4\.ip_forward|net\.core\.somaxconn|net\.core\.netdev_max_backlog|net\.ipv4\.tcp_(rmem|wmem)|net\.core\.(rmem|wmem)_(max|default)|vm\.swappiness|vm\.vfs_cache_pressure|net\.ipv4\.tcp_syncookies|net\.ipv4\.tcp_max_tw_buckets|net\.ipv4\.tcp_(keepalive_time|keepalive_intvl|keepalive_probes)|net\.ipv4\.tcp_rfc1337)/# \0/' \
+      's/^\s*(net\.netfilter\.nf_conntrack_|net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc|net\.ipv4\.ip_forward|net\.core\.somaxconn|net\.core\.netdev_max_backlog|net\.ipv4\.tcp_max_syn_backlog|net\.ipv4\.tcp_(rmem|wmem)|net\.core\.(rmem|wmem)_(max|default)|vm\.swappiness|vm\.vfs_cache_pressure|net\.ipv4\.tcp_syncookies|net\.ipv4\.tcp_max_tw_buckets|net\.ipv4\.tcp_(keepalive_time|keepalive_intvl|keepalive_probes)|net\.ipv4\.tcp_rfc1337)/# \0/' \
       /etc/sysctl.conf || true
   fi
 
@@ -748,7 +788,10 @@ EOM
   shopt -s nullglob
   for f in /etc/systemd/journald.conf.d/*.conf; do
     [[ "$f" == "/etc/systemd/journald.conf.d/90-edge.conf" ]] && continue
-    move_aside "$f"
+    # Move aside ONLY if the file touches keys we manage (avoid moving unrelated journald settings)
+    if grep -Eq '^\s*(SystemMaxUse|RuntimeMaxUse|RateLimitIntervalSec|RateLimitBurst|Compress)\s*=' "$f"; then
+      move_aside "$f"
+    fi
   done
   shopt -u nullglob
 
@@ -912,7 +955,12 @@ case "${1:-}" in
   status)   shift; status_cmd "$@" ;;
   *)
     echo "Usage: sudo $0 {apply|rollback|status}"
-    echo "Optional: EDGE_BACKUP_BASE=/path to override backup location"
+    echo "Optional env:"
+    echo "  EDGE_BACKUP_BASE=/path      override backup location"
+    echo "  EDGE_SYSCTL_MOVE=0|1        move aside conflicting sysctl files (default: 1)"
+    echo "  EDGE_MOVE_WARN=50           warn threshold for moved-aside count"
+    echo "  EDGE_MOVE_SHOW=50           how many moved-aside paths to print"
+    echo "  FORCE_PROFILE=low|mid|high|xhigh|2xhigh|dedicated|dedicated+  override profile"
     exit 1
     ;;
 esac
