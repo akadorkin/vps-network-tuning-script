@@ -73,14 +73,25 @@ manifest=""
 mkbackup() {
   local tsd="${BACKUP_TS:-${EDGE_BACKUP_TS:-}}"
   [[ -n "$tsd" ]] || tsd="$(date +%Y%m%d-%H%M%S)"
-  backup_dir="/root/edge-tuning-backup-${tsd}"
+
+  # root home from passwd (works even if /root doesn't exist)
+  local root_home
+  root_home="$(getent passwd root 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$root_home" ]] || root_home="/root"
+
+  # allow override via EDGE_BACKUP_BASE
+  local base="${EDGE_BACKUP_BASE:-$root_home}"
+
+  backup_dir="${base}/edge-tuning-backup-${tsd}"
   moved_dir="${backup_dir}/moved"
   manifest="${backup_dir}/MANIFEST.tsv"
-  mkdir -p "$backup_dir" "$moved_dir"
-  : > "$manifest"
+
+  mkdir -p "${backup_dir}/files" "$moved_dir" || die "Cannot create backup dir: $backup_dir"
+  : > "$manifest" || die "Cannot write manifest: $manifest"
 }
 
 backup_file() {
+  [[ -n "${backup_dir:-}" && -n "${manifest:-}" ]] || die "Backup not initialized (mkbackup not called?)"
   local src="$1"
   [[ -f "$src" ]] || return 0
   local rel="${src#/}"
@@ -91,6 +102,7 @@ backup_file() {
 }
 
 move_aside() {
+  [[ -n "${backup_dir:-}" && -n "${manifest:-}" ]] || die "Backup not initialized (mkbackup not called?)"
   local src="$1"
   [[ -f "$src" ]] || return 0
   local rel="${src#/}"
@@ -123,7 +135,17 @@ restore_manifest() {
 }
 
 latest_backup_dir() {
-  ls -1dt /root/edge-tuning-backup-* 2>/dev/null | head -n1 || true
+  # Try common locations (root home may be not /root)
+  local root_home
+  root_home="$(getent passwd root 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$root_home" ]] || root_home="/root"
+
+  ls -1dt \
+    "${EDGE_BACKUP_BASE:-$root_home}"/edge-tuning-backup-* \
+    /root/edge-tuning-backup-* \
+    /var/backups/edge-tuning-backup-* \
+    /tmp/edge-tuning-backup-* \
+    2>/dev/null | head -n1 || true
 }
 
 ###############################################################################
@@ -396,7 +418,6 @@ print_manifest_compact() {
 
   if [[ "$moves" -gt 0 ]]; then
     hdr "Moved aside"
-    # NOTE: sed avoids SIGPIPE issues with pipefail (head can make awk exit non-zero)
     awk -F'\t' '$1=="MOVE"{print "  - " $2}' "$man" | sed -n '1,50p'
     [[ "$moves" -gt 50 ]] && echo "  (showing first 50)"
   fi
@@ -407,8 +428,13 @@ print_manifest_compact() {
 ###############################################################################
 on_apply_fail() {
   local code=$?
-  err "Apply failed (exit code=$code)."
-  warn "Rollback: sudo BACKUP_DIR=$backup_dir $0 rollback"
+  err "Apply failed (exit code=$code) at line ${BASH_LINENO[0]}: ${BASH_COMMAND}"
+  err "backup_dir=${backup_dir:-<empty>} manifest=${manifest:-<empty>}"
+  if [[ -n "${backup_dir:-}" ]]; then
+    warn "Rollback: sudo BACKUP_DIR=$backup_dir $0 rollback"
+  else
+    warn "Rollback: no backup_dir was created (failure happened very early)."
+  fi
   exit "$code"
 }
 
@@ -618,7 +644,6 @@ apply_cmd() {
     [[ -f "$f" ]] || continue
     case "$f" in
       /etc/sysctl.d/90-edge-network.conf|/etc/sysctl.d/92-edge-safe.conf|/etc/sysctl.d/95-edge-forward.conf|/etc/sysctl.d/96-edge-vm.conf|/etc/sysctl.d/99-edge-conntrack.conf) continue ;;
-      # Do not touch Tailscale sysctl snippets (avoid breaking tailscale-managed settings)
       /etc/sysctl.d/*tailscale*.conf|/etc/sysctl.d/99-tailscale-forwarding.conf) continue ;;
     esac
     if grep -Eq 'nf_conntrack_|tcp_congestion_control|default_qdisc|ip_forward|somaxconn|netdev_max_backlog|tcp_rmem|tcp_wmem|rmem_max|wmem_max|vm\.swappiness|vfs_cache_pressure|tcp_syncookies|tcp_max_tw_buckets|tcp_keepalive|tcp_mtu_probing|tcp_fin_timeout|tcp_tw_reuse|tcp_slow_start_after_idle|tcp_rfc1337' "$f"; then
@@ -822,7 +847,7 @@ rollback_cmd() {
 
   local backup="${BACKUP_DIR:-}"
   [[ -n "$backup" ]] || backup="$(latest_backup_dir)"
-  [[ -n "$backup" && -d "$backup" ]] || die "Backup not found. Set BACKUP_DIR=/root/edge-tuning-backup-... or run apply first."
+  [[ -n "$backup" && -d "$backup" ]] || die "Backup not found. Set BACKUP_DIR=/path/edge-tuning-backup-... or run apply first."
 
   local man="${backup}/MANIFEST.tsv"
   snapshot_before
@@ -887,6 +912,7 @@ case "${1:-}" in
   status)   shift; status_cmd "$@" ;;
   *)
     echo "Usage: sudo $0 {apply|rollback|status}"
+    echo "Optional: EDGE_BACKUP_BASE=/path to override backup location"
     exit 1
     ;;
 esac
