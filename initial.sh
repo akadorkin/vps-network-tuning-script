@@ -4,21 +4,24 @@ set -Eeuo pipefail
 ###############################################################################
 # VPS Network Tuning Script (external)
 #
-# Patch notes (your requested “tune”):
-# - Removed any "fatal" behavior when many files are moved aside (no more apply fail
-#   just because moved count is high).
-# - Added soft thresholds:
-#     EDGE_MOVE_WARN=50   (warn when moved_aside count exceeds this)
-#     EDGE_MOVE_SHOW=50   (how many moved paths to print)
-# - Journald: DO NOT move aside every *.conf in journald.conf.d.
-#   Move aside only those that conflict with keys we manage.
-# - Sysctl move-aside: keep original behavior, but made the matching more focused.
-#   You can disable sysctl move-aside entirely with:
+# Updated for VPN/edge nodes with many long-lived connections:
+# - No fatal behavior if many files are moved aside
+# - Soft thresholds:
+#     EDGE_MOVE_WARN=50
+#     EDGE_MOVE_SHOW=50
+# - Journald: move aside only files that conflict with keys we manage
+# - Sysctl move-aside can be disabled with:
 #     EDGE_SYSCTL_MOVE=0
 #
-# Hardening fix:
-# - print_manifest_compact(): numeric comparisons are now safe even if parsing
-#   yields empty values (prevents [[ ... -gt ... ]] from triggering ERR under -eE).
+# Key safety changes:
+# - ip_forward now goes into an EARLY sysctl file so later IPv4 tuning
+#   is applied after forwarding mode is set
+# - Removed aggressive:
+#     net.ipv4.tcp_tw_reuse
+#     net.ipv4.tcp_fin_timeout
+#     net.netfilter.nf_conntrack_* timeout overrides
+# - Removed unattended-upgrades reboot tuning from this script
+# - Removed catch-all copytruncate logrotate rule
 ###############################################################################
 
 ###############################################################################
@@ -36,7 +39,7 @@ c_yel=$'\033[33m'
 c_grn=$'\033[32m'
 c_cyan=$'\033[36m'
 
-color() { # color <ansi> <text>
+color() {
   local code="$1"; shift
   if _is_tty; then
     printf "%s%s%s" "$code" "$*" "$c_reset"
@@ -82,7 +85,7 @@ confirm() {
   [[ "${EDGE_CONFIRM:-0}" == "1" ]] || return 0
   [[ -t 0 ]] || return 0
   echo
-  echo "This will tune sysctl, swap, limits, journald, unattended-upgrades, logrotate, tmpfiles."
+  echo "This will tune sysctl, swap, limits, journald, logrotate, tmpfiles."
   read -r -p "Continue? [y/N] " ans
   [[ "$ans" == "y" || "$ans" == "Y" ]] || die "Cancelled."
 }
@@ -98,12 +101,10 @@ mkbackup() {
   local tsd="${BACKUP_TS:-${EDGE_BACKUP_TS:-}}"
   [[ -n "$tsd" ]] || tsd="$(date +%Y%m%d-%H%M%S)"
 
-  # root home from passwd (works even if /root doesn't exist)
   local root_home
   root_home="$(getent passwd root 2>/dev/null | cut -d: -f6 || true)"
   [[ -n "$root_home" ]] || root_home="/root"
 
-  # allow override via EDGE_BACKUP_BASE
   local base="${EDGE_BACKUP_BASE:-$root_home}"
 
   backup_dir="${base}/edge-tuning-backup-${tsd}"
@@ -159,7 +160,6 @@ restore_manifest() {
 }
 
 latest_backup_dir() {
-  # Try common locations (root home may be not /root)
   local root_home
   root_home="$(getent passwd root 2>/dev/null | cut -d: -f6 || true)"
   [[ -n "$root_home" ]] || root_home="/root"
@@ -218,19 +218,6 @@ _logrotate_mode() {
   echo "${freq:-?} / rotate ${rot:-?}"
 }
 
-_unattended_reboot_setting() {
-  local reboot time
-  reboot="$(grep -Rhs 'Unattended-Upgrade::Automatic-Reboot' /etc/apt/apt.conf.d/*.conf 2>/dev/null \
-    | sed -nE 's/.*Automatic-Reboot\s+"([^"]+)".*/\1/p' | tail -n1 || true)"
-  time="$(grep -Rhs 'Unattended-Upgrade::Automatic-Reboot-Time' /etc/apt/apt.conf.d/*.conf 2>/dev/null \
-    | sed -nE 's/.*Automatic-Reboot-Time\s+"([^"]+)".*/\1/p' | tail -n1 || true)"
-  [[ -z "${reboot:-}" ]] && reboot="-"
-  [[ -z "${time:-}" ]] && time="-"
-  echo "${reboot} / ${time}"
-}
-_unattended_state() { echo "${1%% / *}"; }
-_unattended_time()  { echo "${1##* / }"; }
-
 _swap_state() {
   local s
   s="$(/sbin/swapon --noheadings --show=NAME,SIZE 2>/dev/null | awk '{$1=$1; print}' | tr '\n' ';' | sed 's/;$//' || true)"
@@ -254,7 +241,6 @@ snapshot_before() {
   B_NOFILE="$(_nofile_systemd)"
   B_JOURNAL="$(_journald_caps)"
   B_LOGROT="$(_logrotate_mode)"
-  B_UNATT="$(_unattended_reboot_setting)"
 }
 
 snapshot_after() {
@@ -268,7 +254,6 @@ snapshot_after() {
   A_NOFILE="$(_nofile_systemd)"
   A_JOURNAL="$(_journald_caps)"
   A_LOGROT="$(_logrotate_mode)"
-  A_UNATT="$(_unattended_reboot_setting)"
 }
 
 ###############################################################################
@@ -319,8 +304,6 @@ tier_max() {
   if [[ "$ra" -ge "$rb" ]]; then echo "$a"; else echo "$b"; fi
 }
 
-# Conntrack soft formula:
-# ct_soft = RAM_MiB * 64 + CPU * 8192
 ct_soft_from_ram_cpu() {
   local mem_mb="$1" cpu="$2"
   local ct=$(( mem_mb * 64 + cpu * 8192 ))
@@ -355,7 +338,7 @@ pick_log_caps() {
 ###############################################################################
 # Output helpers
 ###############################################################################
-row_kv() { # key width 12
+row_kv() {
   local k="$1" v="$2"
   printf "%-12s | %s\n" "$k" "$v"
 }
@@ -398,8 +381,6 @@ print_planned_table() {
   row_kv "Swappiness"  "${P_SWAPPINESS}"
   row_kv "Journald"    "${P_JOURNAL_CAP}"
   row_kv "Logrotate"   "rotate ${P_LR_ROTATE}"
-  row_kv "Auto reboot" "false"
-  row_kv "Reboot time" "04:00"
 }
 
 print_before_after_all() {
@@ -425,8 +406,6 @@ print_before_after_all() {
   row3 "Nofile"      "$B_NOFILE" "$A_NOFILE"
   row3 "Journald"    "$B_JOURNAL" "$A_JOURNAL"
   row3 "Logrotate"   "$B_LOGROT" "$A_LOGROT"
-  row3 "Auto reboot" "$(_unattended_state "$B_UNATT")" "$(_unattended_state "$A_UNATT")"
-  row3 "Reboot time" "$(_unattended_time "$B_UNATT")"  "$(_unattended_time "$A_UNATT")"
 }
 
 _manifest_counts() {
@@ -448,7 +427,6 @@ print_manifest_compact() {
   local show="${EDGE_MOVE_SHOW:-50}"
   local warn_at="${EDGE_MOVE_WARN:-50}"
 
-  # harden: ensure integers even if parsing yields empty
   local moves_i show_i warn_i copies_i
   copies_i="$(to_int "${copies:-0}")"
   moves_i="$(to_int "${moves:-0}")"
@@ -497,7 +475,6 @@ apply_cmd() {
   mkbackup
   snapshot_before
 
-  # Discover resources
   local mem_kb mem_mb cpu
   mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
   mem_mb="$((mem_kb / 1024))"
@@ -506,7 +483,6 @@ apply_cmd() {
   local disk_mb
   disk_mb="$(disk_size_mb_for_logs)"
 
-  # Tiers
   local gib ram_tier cpu_tier tier profile
   gib="$(ceil_gib "$mem_mb")"
   ram_tier="$(ceil_to_tier "$gib")"
@@ -514,16 +490,13 @@ apply_cmd() {
   tier="$(tier_max "$ram_tier" "$cpu_tier")"
   profile="$(profile_from_tier "$tier")"
 
-  # Manual override
   if [[ "${FORCE_PROFILE:-}" =~ ^(low|mid|high|xhigh|2xhigh|dedicated|dedicated\+)$ ]]; then
     profile="${FORCE_PROFILE}"
   fi
 
-  # Disk-aware log caps
   pick_log_caps "$disk_mb"
   local j_system="$J_SYSTEM" j_runtime="$J_RUNTIME" logrotate_rotate="$LR_ROTATE"
 
-  # Defaults by profile (network + limits)
   local somaxconn netdev_backlog syn_backlog rmem_max wmem_max rmem_def wmem_def tcp_rmem tcp_wmem
   local swappiness nofile_profile tw_profile
   local ct_min ct_cap
@@ -608,7 +581,6 @@ apply_cmd() {
       ;;
   esac
 
-  # Never decrease: use current as floor
   local current_ct current_tw current_nofile
   current_ct="$(to_int "$B_CT_MAX")"
   current_tw="$(to_int "$B_TW")"
@@ -618,14 +590,12 @@ apply_cmd() {
   nofile_final="$(imax "$current_nofile" "$nofile_profile")"
   tw_final="$(imax "$current_tw" "$tw_profile")"
 
-  # Conntrack: compute -> clamp -> never-decrease
   local ct_soft ct_clamped ct_final
   ct_soft="$(ct_soft_from_ram_cpu "$mem_mb" "$cpu")"
   ct_clamped="$(clamp "$ct_soft" "$ct_min" "$ct_cap")"
   ct_final="$(imax "$current_ct" "$ct_clamped")"
   local ct_buckets=$((ct_final/4)); [[ "$ct_buckets" -lt 4096 ]] && ct_buckets=4096
 
-  # Planned globals
   P_TCP_CC="bbr"
   P_QDISC="fq"
   P_FWD="1"
@@ -638,7 +608,6 @@ apply_cmd() {
   P_JOURNAL_CAP="${j_system}/${j_runtime}"
   P_LR_ROTATE="$logrotate_rotate"
 
-  # ---- swap sizing ----
   backup_file /etc/fstab
   local swap_gb=2
   if   [[ "$mem_mb" -lt 2048  ]]; then swap_gb=1
@@ -688,24 +657,21 @@ apply_cmd() {
     fi
   fi
 
-  # ---- sysctl ----
   backup_file /etc/sysctl.conf
 
-  # Optional: disable sysctl move-aside completely
   local sysctl_move="${EDGE_SYSCTL_MOVE:-1}"
 
   shopt -s nullglob
   for f in /etc/sysctl.d/*.conf; do
     [[ -f "$f" ]] || continue
     case "$f" in
-      /etc/sysctl.d/90-edge-network.conf|/etc/sysctl.d/92-edge-safe.conf|/etc/sysctl.d/95-edge-forward.conf|/etc/sysctl.d/96-edge-vm.conf|/etc/sysctl.d/99-edge-conntrack.conf) continue ;;
+      /etc/sysctl.d/05-edge-forward.conf|/etc/sysctl.d/90-edge-network.conf|/etc/sysctl.d/92-edge-safe.conf|/etc/sysctl.d/96-edge-vm.conf|/etc/sysctl.d/99-edge-conntrack.conf) continue ;;
       /etc/sysctl.d/*tailscale*.conf|/etc/sysctl.d/99-tailscale-forwarding.conf) continue ;;
     esac
 
     [[ "$sysctl_move" == "1" ]] || continue
 
-    # Focused match: only keys we actually manage here
-    if grep -Eq '^\s*(net\.netfilter\.nf_conntrack_|net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc|net\.ipv4\.ip_forward|net\.core\.somaxconn|net\.core\.netdev_max_backlog|net\.ipv4\.tcp_max_syn_backlog|net\.ipv4\.tcp_(rmem|wmem)|net\.core\.(rmem|wmem)_(max|default)|vm\.swappiness|vm\.vfs_cache_pressure|net\.ipv4\.tcp_syncookies|net\.ipv4\.tcp_max_tw_buckets|net\.ipv4\.tcp_rfc1337|net\.ipv4\.tcp_keepalive_|net\.ipv4\.tcp_mtu_probing|net\.ipv4\.tcp_fin_timeout|net\.ipv4\.tcp_tw_reuse|net\.ipv4\.tcp_slow_start_after_idle)\s*=' "$f"; then
+    if grep -Eq '^\s*(net\.netfilter\.nf_conntrack_(max|buckets)|net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc|net\.ipv4\.ip_forward|net\.core\.somaxconn|net\.core\.netdev_max_backlog|net\.ipv4\.tcp_max_syn_backlog|net\.ipv4\.tcp_(rmem|wmem)|net\.core\.(rmem|wmem)_(max|default)|vm\.swappiness|vm\.vfs_cache_pressure|net\.ipv4\.tcp_syncookies|net\.ipv4\.tcp_max_tw_buckets|net\.ipv4\.tcp_keepalive_|net\.ipv4\.tcp_mtu_probing|net\.ipv4\.tcp_slow_start_after_idle|net\.ipv4\.tcp_rfc1337)\s*=' "$f"; then
       move_aside "$f"
     fi
   done
@@ -713,7 +679,7 @@ apply_cmd() {
 
   if [[ -f /etc/sysctl.conf ]]; then
     sed -i -E \
-      's/^\s*(net\.netfilter\.nf_conntrack_|net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc|net\.ipv4\.ip_forward|net\.core\.somaxconn|net\.core\.netdev_max_backlog|net\.ipv4\.tcp_max_syn_backlog|net\.ipv4\.tcp_(rmem|wmem)|net\.core\.(rmem|wmem)_(max|default)|vm\.swappiness|vm\.vfs_cache_pressure|net\.ipv4\.tcp_syncookies|net\.ipv4\.tcp_max_tw_buckets|net\.ipv4\.tcp_(keepalive_time|keepalive_intvl|keepalive_probes)|net\.ipv4\.tcp_rfc1337)/# \0/' \
+      's/^\s*(net\.netfilter\.nf_conntrack_(max|buckets)|net\.ipv4\.tcp_congestion_control|net\.core\.default_qdisc|net\.ipv4\.ip_forward|net\.core\.somaxconn|net\.core\.netdev_max_backlog|net\.ipv4\.tcp_max_syn_backlog|net\.ipv4\.tcp_(rmem|wmem)|net\.core\.(rmem|wmem)_(max|default)|vm\.swappiness|vm\.vfs_cache_pressure|net\.ipv4\.tcp_syncookies|net\.ipv4\.tcp_max_tw_buckets|net\.ipv4\.tcp_(keepalive_time|keepalive_intvl|keepalive_probes)|net\.ipv4\.tcp_rfc1337|net\.ipv4\.tcp_mtu_probing|net\.ipv4\.tcp_slow_start_after_idle)\s*=/# &/' \
       /etc/sysctl.conf || true
   fi
 
@@ -721,6 +687,9 @@ apply_cmd() {
   mkdir -p /etc/modules-load.d
   backup_file /etc/modules-load.d/edge-conntrack.conf
   echo nf_conntrack > /etc/modules-load.d/edge-conntrack.conf
+
+  # EARLY: set ip_forward before later IPv4 tuning files
+  echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/05-edge-forward.conf
 
   cat > /etc/sysctl.d/90-edge-network.conf <<EOM
 net.core.default_qdisc = fq
@@ -735,15 +704,11 @@ net.core.wmem_default = ${wmem_def}
 net.ipv4.tcp_rmem = ${tcp_rmem}
 net.ipv4.tcp_wmem = ${tcp_wmem}
 net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_fin_timeout = 10
-net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 EOM
-
-  echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/95-edge-forward.conf
 
   cat > /etc/sysctl.d/96-edge-vm.conf <<EOM
 vm.swappiness = ${swappiness}
@@ -753,10 +718,6 @@ EOM
   cat > /etc/sysctl.d/99-edge-conntrack.conf <<EOM
 net.netfilter.nf_conntrack_max = ${ct_final}
 net.netfilter.nf_conntrack_buckets = ${ct_buckets}
-net.netfilter.nf_conntrack_tcp_timeout_established = 900
-net.netfilter.nf_conntrack_tcp_timeout_time_wait = 15
-net.netfilter.nf_conntrack_udp_timeout = 30
-net.netfilter.nf_conntrack_udp_timeout_stream = 60
 EOM
 
   cat > /etc/sysctl.d/92-edge-safe.conf <<EOM
@@ -770,7 +731,6 @@ EOM
 
   sysctl --system >/dev/null 2>&1 || true
 
-  # ---- NOFILE ----
   backup_file /etc/systemd/system.conf || true
   mkdir -p /etc/systemd/system.conf.d
   shopt -s nullglob
@@ -802,12 +762,10 @@ EOM
 
   systemctl daemon-reexec >/dev/null 2>&1 || true
 
-  # ---- journald ----
   mkdir -p /etc/systemd/journald.conf.d
   shopt -s nullglob
   for f in /etc/systemd/journald.conf.d/*.conf; do
     [[ "$f" == "/etc/systemd/journald.conf.d/90-edge.conf" ]] && continue
-    # Move aside ONLY if the file touches keys we manage
     if grep -Eq '^\s*(SystemMaxUse|RuntimeMaxUse|RateLimitIntervalSec|RateLimitBurst|Compress)\s*=' "$f"; then
       move_aside "$f"
     fi
@@ -824,20 +782,6 @@ RateLimitBurst=1000
 EOM
   systemctl restart systemd-journald >/dev/null 2>&1 || true
 
-  # ---- unattended-upgrades ----
-  mkdir -p /etc/apt/apt.conf.d
-  backup_file /etc/apt/apt.conf.d/99-edge-unattended.conf
-  cat > /etc/apt/apt.conf.d/99-edge-unattended.conf <<'EOM'
-Unattended-Upgrade::Automatic-Reboot "false";
-Unattended-Upgrade::Automatic-Reboot-Time "04:00";
-EOM
-
-  # irqbalance
-  if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^irqbalance\.service'; then
-    systemctl enable --now irqbalance >/dev/null 2>&1 || true
-  fi
-
-  # ---- logrotate ----
   backup_file /etc/logrotate.conf
   cat > /etc/logrotate.conf <<EOM
 daily
@@ -851,41 +795,6 @@ su root adm
 include /etc/logrotate.d
 EOM
 
-  mkdir -p /etc/logrotate.d
-  backup_file /etc/logrotate.d/edge-all-text-logs
-  cat > /etc/logrotate.d/edge-all-text-logs <<EOM
-/var/log/syslog
-/var/log/kern.log
-/var/log/auth.log
-/var/log/daemon.log
-/var/log/user.log
-/var/log/messages
-/var/log/dpkg.log
-/var/log/apt/history.log
-/var/log/apt/term.log
-/var/log/*.log
-/var/log/*/*.log
-/var/log/*/*/*.log
-/var/log/*.out
-/var/log/*/*.out
-/var/log/*.err
-/var/log/*/*.err
-{
-  daily
-  rotate ${logrotate_rotate}
-  compress
-  delaycompress
-  missingok
-  notifempty
-  copytruncate
-  sharedscripts
-  postrotate
-    systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
-  endscript
-}
-EOM
-
-  # ---- tmpfiles ----
   mkdir -p /etc/tmpfiles.d
   backup_file /etc/tmpfiles.d/edge-tmp.conf
   cat > /etc/tmpfiles.d/edge-tmp.conf <<'EOM'
@@ -914,17 +823,15 @@ rollback_cmd() {
   local man="${backup}/MANIFEST.tsv"
   snapshot_before
 
-  rm -f /etc/sysctl.d/90-edge-network.conf \
+  rm -f /etc/sysctl.d/05-edge-forward.conf \
+        /etc/sysctl.d/90-edge-network.conf \
         /etc/sysctl.d/92-edge-safe.conf \
-        /etc/sysctl.d/95-edge-forward.conf \
         /etc/sysctl.d/96-edge-vm.conf \
         /etc/sysctl.d/99-edge-conntrack.conf \
         /etc/modules-load.d/edge-conntrack.conf \
         /etc/systemd/system.conf.d/90-edge.conf \
         /etc/security/limits.d/90-edge.conf \
         /etc/systemd/journald.conf.d/90-edge.conf \
-        /etc/apt/apt.conf.d/99-edge-unattended.conf \
-        /etc/logrotate.d/edge-all-text-logs \
         /etc/tmpfiles.d/edge-tmp.conf 2>/dev/null || true
 
   restore_manifest "$backup"
@@ -964,8 +871,6 @@ status_cmd() {
   row_kv "Nofile"     "$B_NOFILE"
   row_kv "Journald"   "$B_JOURNAL"
   row_kv "Logrotate"  "$B_LOGROT"
-  row_kv "AutoReboot" "$(_unattended_state "$B_UNATT")"
-  row_kv "RebootTime" "$(_unattended_time "$B_UNATT")"
 }
 
 case "${1:-}" in
